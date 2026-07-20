@@ -295,13 +295,20 @@ struct ProfileCard: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Button(action: launch) {
-                Text(isRunning ? "Focus" : "Launch")
-                    .frame(maxWidth: .infinity)
+            if isRunning {
+                Button(action: launch) {
+                    Text("Focus").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            } else {
+                Button(action: launch) {
+                    Text("Launch").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(claudeTint)
+                .controlSize(.small)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(isRunning ? .secondary : claudeTint)
-            .controlSize(.small)
         }
         .padding(14)
         .frame(maxWidth: .infinity)
@@ -313,16 +320,37 @@ struct ProfileCard: View {
             RoundedRectangle(cornerRadius: 14)
                 .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
         )
+        .overlay(alignment: .topTrailing) {
+            // Discoverable stand-in for the right-click context menu.
+            Menu {
+                cardActions
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .padding(7)
+            .opacity(hovering ? 1.0 : 0.4)
+        }
         .scaleEffect(hovering ? 1.02 : 1.0)
         .animation(.easeOut(duration: 0.12), value: hovering)
         .onHover { hovering = $0 }
         .contextMenu {
-            Button("Launch") { launch() }
-            Button("Reveal Data Folder in Finder") { reveal() }
-            if let remove {
-                Divider()
-                Button("Remove…", role: .destructive) { remove() }
-            }
+            cardActions
+        }
+    }
+
+    // Shared between the right-click context menu and the ellipsis button.
+    @ViewBuilder
+    private var cardActions: some View {
+        Button("Launch") { launch() }
+        Button("Reveal Data Folder in Finder") { reveal() }
+        if let remove {
+            Divider()
+            Button("Remove…", role: .destructive) { remove() }
         }
     }
 }
