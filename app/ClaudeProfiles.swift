@@ -51,15 +51,41 @@ func runTool(_ tool: String, _ args: [String], env: [String: String] = [:]) thro
 
 // MARK: - Model
 
+// Mirrors the HUES palette in bin/cdp — names must stay in sync.
+struct ProfileColor: Identifiable, Hashable {
+    let name: String
+    let hue: Double        // degrees of hue rotation applied to Claude's icon
+    let swatch: Color      // matching UI accent
+
+    var id: String { name }
+
+    static let all: [ProfileColor] = [
+        ProfileColor(name: "orange", hue: 0,   swatch: Color(red: 0.85, green: 0.47, blue: 0.34)),
+        ProfileColor(name: "red",    hue: -25, swatch: Color(red: 0.86, green: 0.34, blue: 0.32)),
+        ProfileColor(name: "yellow", hue: 40,  swatch: Color(red: 0.80, green: 0.63, blue: 0.25)),
+        ProfileColor(name: "green",  hue: 110, swatch: Color(red: 0.36, green: 0.69, blue: 0.42)),
+        ProfileColor(name: "teal",   hue: 160, swatch: Color(red: 0.27, green: 0.65, blue: 0.62)),
+        ProfileColor(name: "blue",   hue: 200, swatch: Color(red: 0.33, green: 0.56, blue: 0.83)),
+        ProfileColor(name: "purple", hue: 250, swatch: Color(red: 0.62, green: 0.47, blue: 0.83)),
+        ProfileColor(name: "pink",   hue: 310, swatch: Color(red: 0.83, green: 0.42, blue: 0.62)),
+    ]
+
+    static func named(_ name: String) -> ProfileColor {
+        all.first { $0.name == name } ?? all[0]
+    }
+}
+
 struct Profile: Identifiable, Hashable {
     let name: String
     let dataDir: String?          // nil = the default Claude install
+    let colorName: String
     var id: String { name }
     var isDefault: Bool { dataDir == nil }
+    var color: ProfileColor { ProfileColor.named(colorName) }
 }
 
 final class ProfileStore: ObservableObject {
-    @Published var profiles: [Profile] = [Profile(name: "Default", dataDir: nil)]
+    @Published var profiles: [Profile] = [Profile(name: "Default", dataDir: nil, colorName: "orange")]
     @Published var running: Set<String> = []
     @Published var errorMessage: String?
 
@@ -67,19 +93,23 @@ final class ProfileStore: ObservableObject {
     private var cdpPath: String? { Bundle.main.path(forResource: "cdp", ofType: nil) }
 
     func refresh() {
-        var list = [Profile(name: "Default", dataDir: nil)]
+        var list = [Profile(name: "Default", dataDir: nil, colorName: "orange")]
         let fm = FileManager.default
         if let entries = try? fm.contentsOfDirectory(atPath: appSupport) {
             for entry in entries.sorted() where entry.hasPrefix("Claude-") {
                 var isDir: ObjCBool = false
                 let full = appSupport + "/" + entry
                 if fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue {
+                    let color = (try? String(contentsOfFile: full + "/.cdp-color", encoding: .utf8))?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "orange"
                     list.append(Profile(name: String(entry.dropFirst("Claude-".count)),
-                                        dataDir: full))
+                                        dataDir: full, colorName: color))
                 }
             }
         }
-        profiles = list
+        // Only publish on actual change: every @Published assignment re-renders
+        // the cards, which dismisses any open Menu mid-interaction.
+        if list != profiles { profiles = list }
         refreshRunning()
     }
 
@@ -88,38 +118,45 @@ final class ProfileStore: ObservableObject {
         var found = Set<String>()
         for lineSub in out.split(separator: "\n") {
             let line = String(lineSub)
-            // Helper (Renderer/GPU/…) processes inherit the flag; only count
-            // the main binary so one instance doesn't show up five times.
-            guard line.contains("Claude.app/Contents/MacOS/Claude"),
+            // Match the main binary of the original bundle OR a profile clone
+            // ("Claude Work.app/Contents/MacOS/Claude"). Helper (Renderer/
+            // GPU/…) processes inherit the flag; skip them so one instance
+            // doesn't show up five times.
+            guard line.contains("/Contents/MacOS/Claude"),
                   !line.contains("Helper") else { continue }
             if let r = line.range(of: "--user-data-dir=") {
                 let rest = String(line[r.upperBound...])
                 for p in profiles {
                     if let d = p.dataDir, rest.hasPrefix(d) { found.insert(p.id) }
                 }
-            } else {
+            } else if line.contains("Claude.app/Contents/MacOS/Claude") {
                 found.insert("Default")
             }
         }
-        running = found
+        // Same deal as refresh(): the 2s poller must not republish an
+        // unchanged set, or it closes menus the user is currently using.
+        if found != running { running = found }
     }
 
     func launch(_ p: Profile) {
-        do {
-            if let d = p.dataDir {
-                // -n forces a new instance; if this profile is already running,
-                // Chromium's singleton lock forwards to it and focuses instead.
-                try runTool("/usr/bin/open", ["-n", "-a", claudeAppPath,
-                                              "--args", "--user-data-dir=\(d)"])
-            } else {
-                try runTool("/usr/bin/open", ["-a", claudeAppPath])
-            }
-        } catch { errorMessage = error.localizedDescription }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self.refreshRunning() }
+        if p.isDefault {
+            do { try runTool("/usr/bin/open", ["-a", claudeAppPath]) }
+            catch { errorMessage = error.localizedDescription }
+        } else {
+            // cdp launch runs the profile from its own Claude.app clone (the
+            // Dock tile wears the profile color and owns the window) or
+            // focuses the running instance without spawning a new window.
+            callCdp(["launch", p.name])
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.refreshRunning() }
     }
 
-    func add(_ name: String) {
-        callCdp(["add", name])
+    func add(_ name: String, color: String) {
+        callCdp(["add", name, "--color", color])
+    }
+
+    func setColor(_ p: Profile, color: String) {
+        callCdp(["color", p.name, color])
     }
 
     func remove(_ p: Profile, deleteData: Bool) {
@@ -180,6 +217,7 @@ struct ContentView: View {
                             isRunning: store.running.contains(p.id),
                             launch: { store.launch(p) },
                             reveal: { store.revealData(p) },
+                            setColor: p.isDefault ? nil : { store.setColor(p, color: $0) },
                             remove: p.isDefault ? nil : { removing = p }
                         )
                     }
@@ -193,7 +231,7 @@ struct ContentView: View {
         .onAppear { store.refresh() }
         .onReceive(timer) { _ in store.refreshRunning() }
         .sheet(isPresented: $showAdd) {
-            AddSheet { name in store.add(name) }
+            AddSheet { name, color in store.add(name, color: color) }
         }
         .confirmationDialog(
             "Remove “\(removing?.name ?? "")”?",
@@ -269,16 +307,16 @@ struct ProfileCard: View {
     let isRunning: Bool
     let launch: () -> Void
     let reveal: () -> Void
+    let setColor: ((String) -> Void)?
     let remove: (() -> Void)?
     @State private var hovering = false
-
-    private let claudeTint = Color(red: 0.85, green: 0.47, blue: 0.34)
 
     var body: some View {
         VStack(spacing: 8) {
             Image(nsImage: claudeIcon)
                 .resizable()
                 .frame(width: 54, height: 54)
+                .hueRotation(.degrees(profile.color.hue))
                 .shadow(color: .black.opacity(hovering ? 0.25 : 0.1),
                         radius: hovering ? 7 : 3, y: 2)
             Text(profile.name)
@@ -306,7 +344,7 @@ struct ProfileCard: View {
                     Text("Launch").frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(claudeTint)
+                .tint(profile.color.swatch)
                 .controlSize(.small)
             }
         }
@@ -348,6 +386,21 @@ struct ProfileCard: View {
     private var cardActions: some View {
         Button("Launch") { launch() }
         Button("Reveal Data Folder in Finder") { reveal() }
+        if let setColor {
+            Menu("Change Color") {
+                ForEach(ProfileColor.all) { c in
+                    Button {
+                        setColor(c.name)
+                    } label: {
+                        if c.name == profile.colorName {
+                            Label(c.name.capitalized, systemImage: "checkmark")
+                        } else {
+                            Text(c.name.capitalized)
+                        }
+                    }
+                }
+            }
+        }
         if let remove {
             Divider()
             Button("Remove…", role: .destructive) { remove() }
@@ -389,7 +442,8 @@ struct AddCard: View {
 struct AddSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
-    let create: (String) -> Void
+    @State private var colorName = "orange"
+    let create: (String, String) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -397,6 +451,23 @@ struct AddSheet: View {
             TextField("personal, client-acme…", text: $name)
                 .textFieldStyle(.roundedBorder)
                 .onSubmit(submit)
+            HStack(spacing: 10) {
+                Image(nsImage: claudeIcon)
+                    .resizable()
+                    .frame(width: 30, height: 30)
+                    .hueRotation(.degrees(ProfileColor.named(colorName).hue))
+                ForEach(ProfileColor.all) { c in
+                    Circle()
+                        .fill(c.swatch)
+                        .frame(width: 18, height: 18)
+                        .overlay(
+                            Circle().strokeBorder(.primary.opacity(c.name == colorName ? 0.8 : 0),
+                                                  lineWidth: 2)
+                        )
+                        .onTapGesture { colorName = c.name }
+                        .help(c.name.capitalized)
+                }
+            }
             Text("Creates a fully isolated Claude — its own login, chats, and settings — plus a Spotlight launcher (“Claude <Name>”).\n\nBefore its first sign-in, quit every other Claude window: the login link lands on whichever instance is running.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -418,7 +489,7 @@ struct AddSheet: View {
     private func submit() {
         let n = name.trimmingCharacters(in: .whitespaces)
         guard !n.isEmpty else { return }
-        create(n)
+        create(n, colorName)
         dismiss()
     }
 }

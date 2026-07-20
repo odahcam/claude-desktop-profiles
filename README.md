@@ -20,16 +20,24 @@ one flag in a native macOS experience.
 
 ## What you get
 
+- **Per-profile colors, all the way to the Dock** — each profile gets a
+  color (orange, red, yellow, green, teal, blue, purple, pink), and the
+  running instance's Dock tile actually wears it: profiles launch from
+  their own APFS clone of Claude.app carrying a hue-tinted Finder icon, so
+  the window lives under the colored tile. Anthropic's code signature stays
+  intact (Finder icons are metadata), so login/Keychain keep working.
 - **Claude Profiles app** — a SwiftUI window with a card per profile:
-  live running indicators, one-click launch, add and remove built in.
-  ⌘Space → "Claude Profiles".
+  live running indicators, one-click launch/focus, color picker, add and
+  remove built in. ⌘Space → "Claude Profiles".
 - **Per-profile Spotlight launchers** — every profile also gets its own
-  "Claude Work.app" / "Claude Personal.app" with the Claude icon, dock-able
-  like any app.
-- **A CLI (`cdp`)** — `cdp add personal`, `cdp list`, `cdp remove`, for
-  scripting and dotfiles people.
+  "Claude Work.app" / "Claude Personal.app" launcher in its color;
+  clicking one launches the profile or focuses it if already running
+  (never a stray extra window).
+- **A CLI (`cdp`)** — `cdp add personal --color blue`, `cdp launch personal`,
+  `cdp color personal teal`, `cdp list`, `cdp remove`, for scripting and
+  dotfiles people.
 - **AppleScript fallback** — no Xcode Command Line Tools? `cdp chooser`
-  builds a zero-dependency dialog picker with the same features.
+  builds a zero-dependency dialog picker (plain icons, same profiles).
 
 All three frontends drive the same implementation: the GUI bundles a copy of
 the `cdp` script and shells out to it.
@@ -51,11 +59,13 @@ Line Tools; it falls back to the AppleScript picker without it) and links
 ⌘Space → "Claude Profiles" → **New profile**. Or:
 
 ```sh
-cdp add personal     # create profile + "Claude Personal" Spotlight launcher
-cdp list             # profiles and launcher health
-cdp remove personal  # remove launcher; asks before touching data
-cdp gui              # (re)build + install the SwiftUI app
-cdp chooser          # build the AppleScript picker instead
+cdp add personal --color blue   # create profile + Spotlight launcher
+cdp launch personal             # launch, or focus if already running
+cdp color personal teal         # change the profile's color
+cdp list                        # profiles and launcher health
+cdp remove personal             # remove launcher; asks before touching data
+cdp gui                         # (re)build + install the SwiftUI app
+cdp chooser                     # build the AppleScript picker instead
 ```
 
 ## Signing in to a new profile — read this once
@@ -75,19 +85,31 @@ that instance back into its own account.
 
 - A profile **is** a folder: `~/Library/Application Support/Claude-<Name>`.
   There is no registry, database, or state file — the GUI, the chooser, and
-  the CLI all discover profiles from the filesystem at runtime.
-- Launchers are built with `osacompile` and run
-  `open -n -a Claude.app --args --user-data-dir=<folder>` (`-n` forces a new
-  instance instead of focusing the running one).
-- Each launcher gets a unique `CFBundleIdentifier` (LaunchServices otherwise
-  treats all AppleScript applets as the same app and misroutes Dock clicks),
-  the Claude `.icns`, and a fresh ad-hoc `codesign` (editing a bundle after
-  compilation breaks its seal, which Gatekeeper reports as "damaged").
+  the CLI all discover profiles from the filesystem at runtime. The color
+  lives in `<folder>/.cdp-color`, so it travels with the profile.
+- **Launching** (`cdp launch`, which everything routes through): each
+  profile runs from its own clone of Claude.app, created with `cp -c` —
+  an APFS copy-on-write clone, ~0.5 s and near-zero disk. The clone gets a
+  hue-tinted **Finder custom icon** (`NSWorkspace.setIcon`): unlike editing
+  the bundle's `.icns`, Finder icons are metadata outside the code seal, so
+  `codesign --verify` still passes and Keychain keeps releasing "Claude
+  Safe Storage" — logins survive. Clones live outside Spotlight's index
+  (`~/Library/Application Support/claude-desktop-profiles/apps`) so they
+  can't be launched without their `--user-data-dir`.
+- **Staying fresh**: on every launch, if the original Claude.app version
+  differs from the clone's, the clone is rebuilt from scratch and re-iconed
+  — clones can't go stale after Claude updates.
+- **Focusing**: if the profile is already running, `cdp launch` activates
+  its PID via `NSRunningApplication` instead of re-launching — Claude's
+  second-instance handler would otherwise open a new window per click.
+- Launchers are `osacompile` applets with unique `CFBundleIdentifier`s
+  (LaunchServices otherwise treats all applets as one app), tinted icons
+  (with the bundled `Assets.car` removed — it otherwise overrides the icns
+  for running apps), and a fresh ad-hoc `codesign` after edits.
 - Running-instance detection reads each Claude process's `--user-data-dir`
-  argument from `ps` — all instances share one binary, so the flag is the
-  only distinguishing feature.
-- Your default Claude install is never touched. Profiles are created empty
-  and never copy credentials; each is signed in independently.
+  argument from `ps` — the flag is the distinguishing feature.
+- Your default Claude install is never touched or modified. Profiles are
+  created empty and never copy credentials; each signs in independently.
 
 ## FAQ
 
@@ -101,13 +123,20 @@ account, or see tools like claude-swap. Out of scope here by design.
 single session with no override. App + claude.ai in the browser is the only
 two-account setup on a phone.
 
-**Is this against the ToS?** It's the same app, launched with a documented
-Chromium flag, signed into accounts you own. Nothing is patched, injected,
-or intercepted.
+**Is this against the ToS?** It's the same app bundle (byte-identical APFS
+clones, signature intact), launched with a documented Chromium flag, signed
+into accounts you own. Nothing is patched, injected, or intercepted.
 
-**Both instances show the same Dock icon while running.** macOS limitation:
-running instances share one binary. Tell them apart by their windows; the
-Spotlight launchers are distinct.
+**Do the clones eat disk?** No — APFS clones share blocks with the
+original. A clone only takes real space if it diverges (e.g. self-updates),
+and every version bump triggers a fresh re-clone that resets divergence.
+
+**What if Claude updates mid-session?** Running instances keep running.
+The next `cdp launch` notices the version change, rebuilds the clone from
+the updated original, and re-applies the color.
+
+**Without Xcode Command Line Tools?** Everything still works; icons stay
+orange (tinting and PID-focus need the small cached Swift helper). 
 
 ## Acknowledgments
 

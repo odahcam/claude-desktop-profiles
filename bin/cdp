@@ -29,6 +29,25 @@ APP_SUPPORT="$HOME/Library/Application Support"
 LAUNCHER_DIR="$HOME/Applications"
 BUNDLE_PREFIX="com.claude-desktop-profiles"
 CHOOSER_NAME="Claude Profiles"
+CACHE_DIR="$HOME/Library/Caches/claude-desktop-profiles"
+# Per-profile clones of Claude.app (APFS copy-on-write) live here, outside
+# Spotlight's index, so nobody launches one without its --user-data-dir.
+CLONES_DIR="$APP_SUPPORT/claude-desktop-profiles/apps"
+
+# Per-profile icon colors: hue rotation (degrees) applied to Claude's icon.
+# The white spark is unaffected by hue shifts; only the orange square moves.
+# A profile's color lives in <dataDir>/.cdp-color so it travels with the
+# profile folder — consistent with the no-registry design.
+typeset -A HUES=(
+  orange 0
+  red    -25
+  yellow 40
+  green  110
+  teal   160
+  blue   200
+  purple 250
+  pink   310
+)
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -55,24 +74,225 @@ displayify() {
   print -- "${(j: :)out}"
 }
 
+# Compiles (and caches) a small Swift tool that writes a hue-rotated copy of
+# an .icns. Needs swiftc; callers fall back to the plain icon without it.
+ensure_tint_tool() {
+  local tool="$CACHE_DIR/tinticon"
+  if [[ -x "$tool" && ! "$SCRIPT_PATH" -nt "$tool" ]]; then
+    print -- "$tool"
+    return 0
+  fi
+  command -v swiftc >/dev/null 2>&1 || return 1
+  local tmp
+  tmp=$(mktemp -d)
+  cat > "$tmp/tinticon.swift" <<'EOF'
+import AppKit
+import CoreImage
+
+// tinticon tint <src.icns> <dst.icns> <hueDegrees>   hue-rotated copy
+// tinticon grid <src.icns> <dst.icns>                quartered multi-hue manager icon
+// tinticon seticon <icon> <target>                   Finder custom icon (Dock honors it,
+//                                                    and it does not break code signatures)
+// tinticon focus <pid>                               activate a running app by pid
+let a = CommandLine.arguments
+guard a.count >= 3 else { exit(2) }
+let mode = a[1]
+
+if mode == "focus" {
+    guard let pid = Int32(a[2]),
+          let ra = NSRunningApplication(processIdentifier: pid) else { exit(3) }
+    ra.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+    exit(0)
+}
+if mode == "seticon" {
+    guard a.count >= 4, let img = NSImage(contentsOfFile: a[2]) else { exit(2) }
+    exit(NSWorkspace.shared.setIcon(img, forFile: a[3], options: []) ? 0 : 3)
+}
+guard a.count >= 4, let src = NSImage(contentsOfFile: a[2]) else { exit(2) }
+let dst = a[3]
+let iconset = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("tint-\(ProcessInfo.processInfo.processIdentifier).iconset")
+try! FileManager.default.createDirectory(at: iconset, withIntermediateDirectories: true)
+
+func tintedCG(_ hue: Double, px: Int) -> CGImage? {
+    guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+                                     bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                     isPlanar: false, colorSpaceName: .calibratedRGB,
+                                     bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    src.draw(in: CGRect(x: 0, y: 0, width: px, height: px))
+    NSGraphicsContext.restoreGraphicsState()
+    guard let ci = CIImage(bitmapImageRep: rep) else { return nil }
+    var out = ci
+    if hue != 0 {
+        let f = CIFilter(name: "CIHueAdjust")!
+        f.setValue(ci, forKey: kCIInputImageKey)
+        f.setValue(hue * .pi / 180, forKey: kCIInputAngleKey)
+        guard let o = f.outputImage else { return nil }
+        out = o
+    }
+    return CIContext().createCGImage(out, from: CGRect(x: 0, y: 0, width: px, height: px))
+}
+
+func emit(_ size: Int, _ scale: Int) {
+    let px = size * scale
+    guard let canvas = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+                                        bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                        isPlanar: false, colorSpaceName: .calibratedRGB,
+                                        bytesPerRow: 0, bitsPerPixel: 0),
+          let ctx = NSGraphicsContext(bitmapImageRep: canvas) else { return }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = ctx
+    if mode == "grid" {
+        // One full-size Claude icon, quartered: each quadrant shows the same
+        // icon in a different hue. Full render clipped per quadrant, so the
+        // artwork lines up seamlessly across the color boundaries.
+        // Top-left orange, top-right blue, bottom-left green, bottom-right
+        // purple (rects below are in CG bottom-left coordinates).
+        let half = Double(px) / 2
+        let quadrants: [(Double, CGRect)] = [
+            (0,   CGRect(x: 0,    y: half, width: half, height: half)),
+            (200, CGRect(x: half, y: half, width: half, height: half)),
+            (110, CGRect(x: 0,    y: 0,    width: half, height: half)),
+            (250, CGRect(x: half, y: 0,    width: half, height: half)),
+        ]
+        let full = CGRect(x: 0, y: 0, width: px, height: px)
+        for (hue, rect) in quadrants {
+            guard let cg = tintedCG(hue, px: px) else { continue }
+            ctx.cgContext.saveGState()
+            ctx.cgContext.clip(to: rect)
+            ctx.cgContext.draw(cg, in: full)
+            ctx.cgContext.restoreGState()
+        }
+    } else {
+        let hue = a.count > 4 ? (Double(a[4]) ?? 0) : 0
+        if let cg = tintedCG(hue, px: px) {
+            ctx.cgContext.draw(cg, in: CGRect(x: 0, y: 0, width: px, height: px))
+        }
+    }
+    NSGraphicsContext.restoreGraphicsState()
+    guard let png = canvas.representation(using: .png, properties: [:]) else { return }
+    let name = scale == 1 ? "icon_\(size)x\(size).png" : "icon_\(size)x\(size)@2x.png"
+    try? png.write(to: iconset.appendingPathComponent(name))
+}
+for s in [16, 32, 128, 256, 512] { emit(s, 1); emit(s, 2) }
+let p = Process()
+p.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")
+p.arguments = ["-c", "icns", iconset.path, "-o", dst]
+try! p.run(); p.waitUntilExit()
+try? FileManager.default.removeItem(at: iconset)
+exit(p.terminationStatus)
+EOF
+  mkdir -p "$CACHE_DIR"
+  swiftc -O -o "$tool" "$tmp/tinticon.swift" 2>/dev/null || { rm -rf "$tmp"; return 1 }
+  rm -rf "$tmp"
+  print -- "$tool"
+}
+
+# Writes the profile icon (hue-rotated when hue != 0 and swiftc is available,
+# Claude's own icon otherwise) to the given path. Returns 1 if no source icon.
+make_icns() {
+  local claude_app="$1" hue="$2" out="$3" icns tool
+  icns=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
+  [[ -n "$icns" ]] || return 1
+  if [[ "$hue" != "0" ]]; then
+    if tool=$(ensure_tint_tool) && "$tool" tint "$icns" "$out" "$hue" 2>/dev/null; then
+      return 0
+    fi
+    warn "Could not tint icon (swiftc missing?). Using the plain Claude icon."
+  fi
+  cp "$icns" "$out"
+}
+
+# The manager app's own icon: a 2x2 multi-hue grid so the Dock/Spotlight
+# entry is distinguishable from an actual Claude instance. Falls back to
+# the plain Claude icon when swiftc is unavailable.
+make_manager_icns() {
+  local claude_app="$1" out="$2" icns tool
+  icns=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
+  [[ -n "$icns" ]] || return 1
+  if tool=$(ensure_tint_tool) && "$tool" grid "$icns" "$out" 2>/dev/null; then
+    return 0
+  fi
+  cp "$icns" "$out"
+}
+
+hue_for_color() {
+  print -- "${HUES[$1]:-0}"
+}
+
+app_version() {
+  /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$1/Contents/Info.plist" 2>/dev/null || print -- "?"
+}
+
+# PID of the main Claude process using this data dir (any bundle — original
+# or clone), empty when not running. The trailing `|| true` matters: under
+# `set -euo pipefail` a no-match grep (exit 1) would otherwise kill the
+# whole script at the call site's assignment.
+instance_pid() {
+  ps -axo pid=,command= 2>/dev/null | grep -F -- "--user-data-dir=$1" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | awk '{print $1}' | head -1 || true
+}
+
+# Sets the clone's Finder custom icon to the profile color. Finder icons are
+# metadata — the Developer ID signature stays valid, which is the entire
+# reason clones are safe: Keychain keeps trusting the app.
+apply_clone_icon() {
+  local claude_app="$1" clone="$2" color="$3" tool tmp
+  tool=$(ensure_tint_tool) || return 0
+  tmp=$(mktemp -d)
+  if make_icns "$claude_app" "$(hue_for_color "$color")" "$tmp/icon.icns"; then
+    "$tool" seticon "$tmp/icon.icns" "$clone" 2>/dev/null || true
+  fi
+  rm -rf "$tmp"
+}
+
+# Creates or refreshes the profile's Claude.app clone. Re-clones whenever the
+# original's version differs, so clones can never go stale after an update
+# (and the custom icon, which updates would wipe, is re-applied).
+ensure_clone() {
+  local claude_app="$1" clone="$2" color="$3"
+  if [[ ! -d "$clone" || "$(app_version "$claude_app")" != "$(app_version "$clone")" ]]; then
+    info "Refreshing profile app clone (APFS copy-on-write)…"
+    rm -rf "$clone"
+    mkdir -p "${clone:h}"
+    /bin/cp -Rc "$claude_app" "$clone" 2>/dev/null || /bin/cp -R "$claude_app" "$clone"
+    apply_clone_icon "$claude_app" "$clone" "$color"
+  fi
+}
+
+color_of_profile() {
+  # Reads <dataDir>/.cdp-color; empty/missing means orange (untinted).
+  local f="$1/.cdp-color"
+  [[ -f "$f" ]] && print -- "$(head -1 "$f" | tr -d '[:space:]')" || print -- "orange"
+}
+
 # Compile an AppleScript source file into a .app with our bundle id and the
-# Claude icon, replacing any existing bundle at that path.
+# Claude icon (optionally hue-tinted), replacing any existing bundle.
+# --stay-open builds a stay-open applet (persistent Dock tile).
 compile_launcher() {
-  local src="$1" app_path="$2" bundle_id="$3" claude_app="$4"
+  local src="$1" app_path="$2" bundle_id="$3" claude_app="$4" hue="${5:-0}"
+  local -a osaflags=()
+  [[ "${6:-}" == "--stay-open" ]] && osaflags+=(-s)
 
   [[ -d "$app_path" ]] && rm -rf "$app_path"
   mkdir -p "${app_path:h}"
-  /usr/bin/osacompile -o "$app_path" "$src"
+  /usr/bin/osacompile $osaflags -o "$app_path" "$src"
 
   local plist="$app_path/Contents/Info.plist"
   /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" "$plist" 2>/dev/null ||
     /usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string $bundle_id" "$plist"
 
+  # osacompile bundles an Assets.car whose built-in applet icon outranks
+  # applet.icns for the RUNNING app's Dock tile (Finder/Spotlight still show
+  # the icns, which makes this easy to miss). Remove the catalog and its
+  # Info.plist reference so our tinted icns is the only icon source.
+  rm -f "$app_path/Contents/Resources/Assets.car"
+  /usr/libexec/PlistBuddy -c "Delete :CFBundleIconName" "$plist" 2>/dev/null || true
+
   # Reuse Claude's own icon so the launcher is recognizable in Spotlight/Dock.
-  local icns
-  icns=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
-  if [[ -n "$icns" && -f "$app_path/Contents/Resources/applet.icns" ]]; then
-    cp "$icns" "$app_path/Contents/Resources/applet.icns"
+  if [[ -f "$app_path/Contents/Resources/applet.icns" ]]; then
+    make_icns "$claude_app" "$hue" "$app_path/Contents/Resources/applet.icns" || true
     /usr/bin/touch "$app_path"
   fi
 
@@ -98,8 +318,9 @@ rebuild_chooser_unless_nested() {
 # ---- commands ---------------------------------------------------------------
 
 cmd_add() {
-  local raw="${1:-}"
-  [[ -n "$raw" ]] || err "Usage: cdp add <name>   (e.g. cdp add personal)"
+  local raw="${1:-}" color=""
+  [[ -n "$raw" ]] || err "Usage: cdp add <name> [--color <color>]   (e.g. cdp add personal --color blue)"
+  [[ "${2:-}" == "--color" && -n "${3:-}" ]] && color="$3"
   local slug display data_dir app_path claude_app
   slug=$(slugify "$raw")
   [[ -n "$slug" ]] || err "Name must contain at least one letter or digit."
@@ -110,18 +331,33 @@ cmd_add() {
 
   mkdir -p "$data_dir"
 
-  # The launcher runs `open -n` so a new instance starts even when another
-  # Claude is already running; without -n macOS routes the request to the
-  # existing window and ignores --user-data-dir.
+  # Recreating a launcher for an existing profile keeps its color unless a
+  # new one is given explicitly.
+  [[ -z "$color" ]] && color=$(color_of_profile "$data_dir")
+  [[ -n "${HUES[$color]+x}" ]] || err "Unknown color '$color'. Available: ${(k)HUES}"
+  print -- "$color" > "$data_dir/.cdp-color"
+
+  # The launcher is a fire-and-forget button: it calls the bundled cdp's
+  # `launch`, which starts the profile from its own Claude.app clone (whose
+  # Dock tile wears the profile color and owns the window) or focuses the
+  # already-running instance, then the applet exits.
   local tmp
   tmp=$(mktemp -d)
   cat > "$tmp/launcher.applescript" <<EOF
-do shell script "open -n -a '$claude_app' --args --user-data-dir='$data_dir' > /dev/null 2>&1 &"
+on run
+	do shell script "/bin/zsh " & quoted form of (POSIX path of (path to me) & "Contents/Resources/cdp") & " launch " & quoted form of "$slug" & " > /dev/null 2>&1"
+end run
 EOF
-  compile_launcher "$tmp/launcher.applescript" "$app_path" "$BUNDLE_PREFIX.$slug" "$claude_app"
+  compile_launcher "$tmp/launcher.applescript" "$app_path" "$BUNDLE_PREFIX.$slug" "$claude_app" "$(hue_for_color "$color")"
   rm -rf "$tmp"
 
-  ok "Profile '$display' created."
+  # Bundle cdp so the launcher drives the same launch path as the GUI and
+  # CLI, then re-sign (the copy broke the seal).
+  cp "$SCRIPT_PATH" "$app_path/Contents/Resources/cdp"
+  chmod +x "$app_path/Contents/Resources/cdp"
+  /usr/bin/codesign --force --sign - "$app_path" 2>/dev/null || true
+
+  ok "Profile '$display' created (color: $color)."
   info "Data folder:  $data_dir"
   info "Launcher:     $app_path  (Spotlight: 'Claude $display')"
   print
@@ -165,8 +401,7 @@ on run
 			do shell script "open -a Claude"
 			return
 		else
-			set dataDir to appSupport & "Claude-" & choice
-			do shell script "open -n -a Claude --args --user-data-dir=" & quoted form of dataDir & " > /dev/null 2>&1 &"
+			do shell script cdpCommand() & " launch " & quoted form of choice & " > /dev/null 2>&1"
 			return
 		end if
 	end repeat
@@ -223,9 +458,70 @@ EOF
   # same code path as the CLI, then re-sign (the copy broke the seal again).
   cp "$SCRIPT_PATH" "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/Resources/cdp"
   chmod +x "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/Resources/cdp"
+  make_manager_icns "$claude_app" "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/Resources/applet.icns" || true
   /usr/bin/codesign --force --sign - "$LAUNCHER_DIR/$CHOOSER_NAME.app" 2>/dev/null || true
 
   [[ "${1:-}" == "--quiet" ]] || ok "Chooser rebuilt: $LAUNCHER_DIR/$CHOOSER_NAME.app  (Spotlight: '$CHOOSER_NAME')"
+}
+
+cmd_launch() {
+  # The single launch path used by the Spotlight launchers, the GUI, and the
+  # chooser. Launches the profile from its own Claude.app clone — so the
+  # running Dock tile wears the profile color and owns the window — or
+  # focuses the existing instance without spawning a new window (Claude's
+  # second-instance handler opens a window per repeated launch attempt,
+  # so we activate the PID directly instead).
+  local raw="${1:-}"
+  [[ -n "$raw" ]] || err "Usage: cdp launch <name>"
+  local display data_dir color clone claude_app pid tool
+  display=$(displayify "$(slugify "$raw")")
+  data_dir="$APP_SUPPORT/Claude-$display"
+  [[ -d "$data_dir" ]] || err "Profile '$display' not found. Create it with: cdp add $raw"
+  color=$(color_of_profile "$data_dir")
+  claude_app=$(find_claude_app)
+  clone="$CLONES_DIR/Claude $display.app"
+
+  pid=$(instance_pid "$data_dir")
+  if [[ -n "$pid" ]]; then
+    if tool=$(ensure_tint_tool) && "$tool" focus "$pid" 2>/dev/null; then
+      return 0
+    fi
+    open "$clone" 2>/dev/null || open -a "$claude_app"
+    return 0
+  fi
+
+  ensure_clone "$claude_app" "$clone" "$color"
+  open "$clone" --args --user-data-dir="$data_dir"
+}
+
+cmd_color() {
+  local raw="${1:-}" color="${2:-}"
+  [[ -n "$raw" && -n "$color" ]] || err "Usage: cdp color <name> <color>   Available: ${(k)HUES}"
+  [[ -n "${HUES[$color]+x}" ]] || err "Unknown color '$color'. Available: ${(k)HUES}"
+  local display data_dir app_path claude_app
+  display=$(displayify "$(slugify "$raw")")
+  data_dir="$APP_SUPPORT/Claude-$display"
+  app_path="$LAUNCHER_DIR/Claude $display.app"
+  [[ -d "$data_dir" ]] || err "Profile '$display' not found."
+  claude_app=$(find_claude_app)
+
+  print -- "$color" > "$data_dir/.cdp-color"
+  ok "Color for '$display' set to $color."
+
+  if [[ -f "$app_path/Contents/Resources/applet.icns" ]]; then
+    make_icns "$claude_app" "$(hue_for_color "$color")" "$app_path/Contents/Resources/applet.icns" || true
+    /usr/bin/codesign --force --sign - "$app_path" 2>/dev/null || true
+    /usr/bin/touch "$app_path"
+    ok "Launcher icon updated. (Finder/Dock may take a moment to refresh.)"
+  else
+    info "No launcher found; run 'cdp add $raw' to create one with this color."
+  fi
+
+  local clone="$CLONES_DIR/Claude $display.app"
+  if [[ -d "$clone" ]]; then
+    apply_clone_icon "$claude_app" "$clone" "$color"
+    ok "Profile app icon updated. (Takes effect on next launch if running.)"
+  fi
 }
 
 cmd_gui() {
@@ -268,9 +564,7 @@ cmd_gui() {
 </plist>
 EOF
 
-  local icns
-  icns=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
-  [[ -n "$icns" ]] && cp "$icns" "$bundle/Contents/Resources/AppIcon.icns"
+  make_manager_icns "$claude_app" "$bundle/Contents/Resources/AppIcon.icns" || true
 
   # Same trick as the chooser: bundle this script so the GUI's add/remove
   # drive the exact same code path as the CLI.
@@ -311,6 +605,9 @@ cmd_remove() {
 
   [[ -d "$app_path" ]] && { rm -rf "$app_path"; ok "Deleted launcher $app_path" }
 
+  local clone="$CLONES_DIR/Claude $display.app"
+  [[ -d "$clone" ]] && { rm -rf "$clone"; ok "Deleted profile app clone" }
+
   if [[ -d "$data_dir" ]]; then
     case "$mode" in
       --delete-data)
@@ -340,7 +637,15 @@ cmd_help() {
 cdp — run multiple Claude Desktop accounts side by side on macOS
 
 USAGE
-  cdp add <name>      Create a profile + Spotlight launcher (e.g. cdp add personal)
+  cdp add <name> [--color <c>]
+                      Create a profile + Spotlight launcher
+                      (e.g. cdp add personal --color blue)
+  cdp launch <name>   Launch a profile (or focus it if already running).
+                      Runs from a per-profile Claude.app clone, so the Dock
+                      tile wears the profile color and owns the window
+  cdp color <name> <c>
+                      Change a profile's icon color
+                      (orange red yellow green teal blue purple pink)
   cdp list            List profiles and launcher health
   cdp remove <name>   Remove a profile's launcher; add --keep-data or
                       --delete-data to skip the interactive question
@@ -359,6 +664,8 @@ EOF
 
 case "${1:-help}" in
   add)     shift; cmd_add "$@" ;;
+  launch)  shift; cmd_launch "$@" ;;
+  color)   shift; cmd_color "$@" ;;
   list)    cmd_list ;;
   remove)  shift; cmd_remove "$@" ;;
   gui)     cmd_gui ;;
