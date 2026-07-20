@@ -39,6 +39,15 @@ one flag in a native macOS experience.
 - **AppleScript fallback** — no Xcode Command Line Tools? `cdp chooser`
   builds a zero-dependency dialog picker (plain icons, same profiles).
 
+Running profiles wear their colors in the Dock — each window lives under
+its profile's tile:
+
+![Colored Dock tiles for running profiles](docs/dock.png)
+
+And every launcher is a first-class Spotlight citizen:
+
+![Colored profile launchers in Spotlight](docs/spotlight.png)
+
 All three frontends drive the same implementation: the GUI bundles a copy of
 the `cdp` script and shells out to it.
 
