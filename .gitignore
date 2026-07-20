@@ -1,0 +1,4 @@
+.DS_Store
+*.swp
+build/
+docs/*.tmp.png
