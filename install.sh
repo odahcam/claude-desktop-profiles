@@ -26,6 +26,13 @@ linked=""
 for dir in /usr/local/bin /opt/homebrew/bin "$HOME/.local/bin"; do
     case ":$PATH:" in *":$dir:"*) ;; *) continue ;; esac
     [ -d "$dir" ] && [ -w "$dir" ] || continue
+    # Replace only an earlier cdp of ours, never another tool's.
+    if [ -e "$dir/cdp" ] || [ -L "$dir/cdp" ]; then
+        if ! head -2 "$dir/cdp" 2>/dev/null | grep -q 'Claude Desktop Profiles'; then
+            echo "ℹ $dir/cdp exists and isn't this tool; leaving it alone."
+            continue
+        fi
+    fi
     ln -sf "$CDP" "$dir/cdp" && linked="$dir" && break
 done
 if [ -n "$linked" ]; then

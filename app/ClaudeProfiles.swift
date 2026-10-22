@@ -3,8 +3,10 @@
 // This app is a frontend only: profile creation and removal shell out to the
 // copy of `cdp` bundled in Resources, so the CLI, the AppleScript chooser,
 // and this app share one implementation. Profiles are discovered from the
-// filesystem (~/Library/Application Support/Claude-<Name>) on every refresh;
-// there is no registry to sync. Running instances are detected by reading
+// filesystem (~/Library/Application Support/Claude-<Name> holding the
+// .cdp-color marker `cdp add` writes — Claude Desktop creates its own
+// Claude-3p there) on every refresh; there is no registry to sync. Running
+// instances are detected by reading
 // each Claude process's --user-data-dir argument out of `ps`, because all
 // instances share one binary and differ only in that flag.
 
@@ -13,6 +15,13 @@ import AppKit
 import Combine
 
 // MARK: - Shared helpers
+
+// Since the macOS 27 SDK, `@State` resolves to a SwiftUI macro whose plugin
+// (libSwiftUIMacros) ships only with Xcode, not the Command Line Tools, so a
+// CLT-only `cdp gui` fails. Spelling the attribute through an alias applies
+// the plain State property wrapper instead: same type, same behavior, and it
+// builds with either toolchain.
+typealias ViewState<Value> = State<Value>
 
 let claudeAppPath: String = {
     let candidates = ["/Applications/Claude.app",
@@ -126,9 +135,9 @@ final class ProfileStore: ObservableObject {
             for entry in entries.sorted() where entry.hasPrefix("Claude-") {
                 var isDir: ObjCBool = false
                 let full = appSupport + "/" + entry
-                if fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue {
-                    let color = (try? String(contentsOfFile: full + "/.cdp-color", encoding: .utf8))?
-                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? "orange"
+                if fm.fileExists(atPath: full, isDirectory: &isDir), isDir.boolValue,
+                   let marker = try? String(contentsOfFile: full + "/.cdp-color", encoding: .utf8) {
+                    let color = marker.trimmingCharacters(in: .whitespacesAndNewlines)
                     list.append(Profile(name: String(entry.dropFirst("Claude-".count)),
                                         dataDir: full, colorName: color))
                 }
@@ -153,8 +162,11 @@ final class ProfileStore: ObservableObject {
                   !line.contains("Helper") else { continue }
             if let r = line.range(of: "--user-data-dir=") {
                 let rest = String(line[r.upperBound...])
+                // Exact match, as in has_data_dir_arg in bin/cdp: ps joins
+                // argv with spaces, so ".../Claude-Work" is a prefix of
+                // ".../Claude-Work Two".
                 for p in profiles {
-                    if let d = p.dataDir, rest.hasPrefix(d) { found.insert(p.id) }
+                    if let d = p.dataDir, rest == d || rest.hasPrefix(d + " -") { found.insert(p.id) }
                 }
             } else if line.contains("Claude.app/Contents/MacOS/Claude") {
                 found.insert("Default")
@@ -243,9 +255,9 @@ struct ClaudeProfilesApp: App {
 
 struct ContentView: View {
     @StateObject private var store = ProfileStore()
-    @State private var showAdd = false
-    @State private var removing: Profile?
-    @State private var confirmWipe: Profile?
+    @ViewState private var showAdd = false
+    @ViewState private var removing: Profile?
+    @ViewState private var confirmWipe: Profile?
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
     private let columns = [GridItem(.adaptive(minimum: 150, maximum: 180), spacing: 14)]
@@ -393,7 +405,7 @@ struct ProfileCard: View {
     let reveal: () -> Void
     let setColor: ((String) -> Void)?
     let remove: (() -> Void)?
-    @State private var hovering = false
+    @ViewState private var hovering = false
 
     var body: some View {
         VStack(spacing: 8) {
@@ -494,7 +506,7 @@ struct ProfileCard: View {
 
 struct AddCard: View {
     let action: () -> Void
-    @State private var hovering = false
+    @ViewState private var hovering = false
 
     var body: some View {
         Button(action: action) {
@@ -525,8 +537,8 @@ struct AddCard: View {
 
 struct AddSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
-    @State private var colorName = "orange"
+    @ViewState private var name = ""
+    @ViewState private var colorName = "orange"
     let create: (String, String) -> Void
 
     var body: some View {

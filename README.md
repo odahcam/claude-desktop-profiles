@@ -96,7 +96,10 @@ that instance back into its own account.
 - A profile **is** a folder: `~/Library/Application Support/Claude-<Name>`.
   There is no registry, database, or state file — the GUI, the chooser, and
   the CLI all discover profiles from the filesystem at runtime. The color
-  lives in `<folder>/.cdp-color`, so it travels with the profile.
+  lives in `<folder>/.cdp-color`, so it travels with the profile; that file
+  is also what marks a folder as a profile, because Claude Desktop creates
+  its own `Claude-3p` folder (third-party inference data) in the same place.
+  The name `3p` is reserved for that reason.
 - **Launching** (`cdp launch`, which everything routes through): each
   profile runs from its own clone of Claude.app, created with `cp -c` —
   an APFS copy-on-write clone, ~0.5 s and near-zero disk. The clone gets a
@@ -118,7 +121,10 @@ that instance back into its own account.
   titled "Claude <Profile>". Clicking a Dock/Recents entry does the same.
   `cdp add` installs a LaunchAgent (`cdp watch`, every 3 s) that quits any
   clone process running without `--user-data-dir` and relaunches it as its
-  profile; `cdp launch` does the same pass first. `cdp watchdog status`
+  profile. It runs a private copy of `cdp` in
+  `~/Library/Application Support/claude-desktop-profiles/`, refreshed only
+  when you install or add a profile, so a `git pull` never goes live on its
+  own; `cdp launch` does the same pass first. `cdp watchdog status`
   shows both.
 - **Staying fresh (self-update, never downgrade)**: each profile updates
   itself — Squirrel installs into the profile's *own* clone bundle, so a

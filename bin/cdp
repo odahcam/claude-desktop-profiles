@@ -10,9 +10,11 @@
 #      dialog that lists every profile (plus your default install) and can
 #      also add and remove profiles without touching the terminal.
 #
-# Profiles are discovered by convention, not by a registry file: any folder
-# matching ~/Library/Application Support/Claude-<Name> is a profile. Delete
-# the folder and the launcher app, and the profile is gone.
+# Profiles are discovered by convention, not by a registry file: a folder
+# ~/Library/Application Support/Claude-<Name> containing a .cdp-color file
+# (written by `cdp add`) is a profile. The marker matters: Claude Desktop
+# itself creates Claude-3p next to its default data folder. Delete the folder
+# and the launcher app, and the profile is gone.
 #
 # The chooser bundles a copy of this script in its Resources and shells out
 # to it for add/remove, so GUI and CLI share one implementation.
@@ -77,6 +79,24 @@ displayify() {
   local out=() part
   for part in ${(s:-:)1}; do out+=("${(C)part}"); done
   print -- "${(j: :)out}"
+}
+
+# Slug for a user-supplied profile name, or exits. Callers must use
+# `slug=$(profile_slug …) || exit 1`: err only leaves the subshell. "3p" is
+# refused because Claude Desktop keeps third-party-inference data in
+# "<userData>-3p" — the default install already owns Claude-3p, and a "3p"
+# profile would share it.
+profile_slug() {
+  local slug
+  slug=$(slugify "$1")
+  [[ -n "$slug" ]] || err "Name must contain at least one letter or digit."
+  [[ "$slug" != 3p ]] || err "'3p' is reserved: Claude Desktop keeps its own third-party-inference data in Claude-3p."
+  print -- "$slug"
+}
+
+# A Claude-* folder is a profile only if cdp marked it (see the header).
+is_profile_dir() {
+  [[ -f "$1/.cdp-color" ]]
 }
 
 # Compiles (and caches) a small Swift helper for icon tinting, Finder icons
@@ -284,12 +304,33 @@ has_custom_icon() {
   [[ -f "$1/Icon"$'\r' ]]
 }
 
+# Main Claude processes (original bundle or clone) as "pid<TAB>executable".
+# Matched on the executable (`comm` is argv[0], the full path, spaces and
+# all), not on a substring of the command line, so `tail …/MacOS/Claude` or
+# a Helper process never counts.
+claude_mains() {
+  local pid exe
+  ps -axo pid=,comm= 2>/dev/null | while read -r pid exe; do
+    [[ "$exe" == */Contents/MacOS/Claude ]] && print -- "$pid"$'\t'"$exe"
+  done || true
+}
+
+# True when the command line carries exactly --user-data-dir=<dir>. `ps`
+# joins argv with spaces, so ".../Claude-Work" is a prefix of
+# ".../Claude-Work Two"; the flag must end the line or precede another flag.
+# Profile names never contain " -" (displayify), so this is unambiguous.
+has_data_dir_arg() {
+  local cmd="$1" arg="--user-data-dir=$2"
+  [[ "$cmd" == *" $arg" || "$cmd" == *" $arg -"* ]]
+}
+
 # PID of the main Claude process using this data dir (any bundle — original
-# or clone), empty when not running. The trailing `|| true` matters: under
-# `set -euo pipefail` a no-match grep (exit 1) would otherwise kill the
-# whole script at the call site's assignment.
+# or clone), empty when not running.
 instance_pid() {
-  ps -axo pid=,command= 2>/dev/null | grep -F -- "--user-data-dir=$1" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | awk '{print $1}' | head -1 || true
+  local pid exe
+  claude_mains | while IFS=$'\t' read -r pid exe; do
+    has_data_dir_arg "$(ps -o command= -p "$pid" 2>/dev/null)" "$1" && { print -- "$pid"; break }
+  done || true
 }
 
 # Claude Code's config dir for this profile. --user-data-dir only scopes
@@ -333,12 +374,12 @@ launch_clone() {
 # still titled "Claude <Profile>". Args are the only thing `ps` lets us
 # check (hardened runtime hides env), and both are dropped together.
 stray_pids() {
-  local line pid cmd rest display
-  ps -axo pid=,command= 2>/dev/null | grep -F -- "$CLONES_DIR/" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | grep -vF -- "--user-data-dir=" | while IFS= read -r line; do
-    pid="${line##[[:space:]]#}"; pid="${pid%% *}"
-    cmd="${line#*"$CLONES_DIR/"}"
-    display="${${cmd%%.app/Contents/MacOS/Claude*}#Claude }"
-    [[ -n "$display" ]] && print -- "$pid"$'\t'"$display"
+  local pid exe display
+  claude_mains | while IFS=$'\t' read -r pid exe; do
+    [[ "$exe" == "$CLONES_DIR/Claude "*.app/Contents/MacOS/Claude ]] || continue
+    [[ "$(ps -o command= -p "$pid" 2>/dev/null)" == *--user-data-dir=* ]] && continue
+    display="${${exe#"$CLONES_DIR/Claude "}%.app/Contents/MacOS/Claude}"
+    [[ -n "$display" && "$display" != */* ]] && print -- "$pid"$'\t'"$display"
   done || true
 }
 
@@ -455,7 +496,11 @@ compile_launcher() {
 }
 
 profile_dirs() {
-  print -l -- "$APP_SUPPORT"/Claude-*(N/)
+  local d
+  for d in "$APP_SUPPORT"/Claude-*(N/); do
+    is_profile_dir "$d" && print -- "$d"
+  done
+  return 0
 }
 
 # When the chooser/GUI app invokes us (CDP_FROM_CHOOSER=1) we must not rebuild
@@ -502,12 +547,23 @@ EOF
 # an old copy behind. Launchers whose profile has no launcher (removed with
 # --keep-data) stay removed.
 sync_install() {
-  local claude_app d display
+  local claude_app d slug display launcher
   claude_app=$(find_claude_app)
   for d in "$APP_SUPPORT"/Claude-*(N/); do
-    display="${${d:t}#Claude-}"
-    [[ -d "$LAUNCHER_DIR/Claude $display.app" ]] || continue
-    build_launcher "$(slugify "$display")" "$display" "$(color_of_profile "$d")" "$claude_app"
+    # Re-derive the name from the slug: the raw folder name is untrusted and
+    # ends up inside the launcher's AppleScript source.
+    slug=$(slugify "${${d:t}#Claude-}")
+    [[ -n "$slug" && "$slug" != 3p ]] || continue
+    display=$(displayify "$slug")
+    launcher="$LAUNCHER_DIR/Claude $display.app"
+    [[ -d "$launcher" ]] || continue
+    # v0.1 profiles predate .cdp-color; a launcher we built proves the
+    # folder is ours, so mark it rather than drop it from discovery.
+    if ! is_profile_dir "$d"; then
+      [[ "$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$launcher/Contents/Info.plist" 2>/dev/null)" == "$BUNDLE_PREFIX.$slug" ]] || continue
+      print -- orange > "$d/.cdp-color"
+    fi
+    build_launcher "$slug" "$display" "$(color_of_profile "$d")" "$claude_app"
   done
   install_watchdog --quiet --restart
   # Pre-bundle helper binary: a TCC-denied anonymous "tinticon".
@@ -522,8 +578,7 @@ cmd_add() {
   [[ -n "$raw" ]] || err "Usage: cdp add <name> [--color <color>]   (e.g. cdp add personal --color blue)"
   [[ "${2:-}" == "--color" && -n "${3:-}" ]] && color="$3"
   local slug display data_dir app_path claude_app
-  slug=$(slugify "$raw")
-  [[ -n "$slug" ]] || err "Name must contain at least one letter or digit."
+  slug=$(profile_slug "$raw") || exit 1
   display=$(displayify "$slug")
   data_dir="$APP_SUPPORT/Claude-$display"
   app_path="$LAUNCHER_DIR/Claude $display.app"
@@ -608,7 +663,7 @@ on run
 end run
 
 on profileNames(appSupport)
-	set raw to do shell script "ls -d " & quoted form of appSupport & "Claude-*/ 2>/dev/null | sed 's|/$||; s|.*/Claude-||' ; true"
+	set raw to do shell script "ls -d " & quoted form of appSupport & "Claude-*/.cdp-color 2>/dev/null | sed 's|/.cdp-color$||; s|.*/Claude-||' ; true"
 	if raw is "" then return {}
 	return paragraphs of raw
 end profileNames
@@ -672,10 +727,12 @@ EOF
 # directly instead).
 launch_profile() {
   local raw="$1"
-  local display data_dir color clone claude_app pid tool
-  display=$(displayify "$(slugify "$raw")")
+  local slug display data_dir color clone claude_app pid tool
+  slug=$(profile_slug "$raw") || exit 1
+  display=$(displayify "$slug")
   data_dir="$APP_SUPPORT/Claude-$display"
   [[ -d "$data_dir" ]] || err "Profile '$display' not found. Create it with: cdp add $raw"
+  is_profile_dir "$data_dir" || err "$data_dir was not created by cdp (no .cdp-color). To use it as a profile anyway: cdp add $raw"
   color=$(color_of_profile "$data_dir")
   claude_app=$(find_claude_app)
   clone="$CLONES_DIR/Claude $display.app"
@@ -730,8 +787,19 @@ cmd_watch() {
 # Installs/removes the LaunchAgent that runs `cdp watch`. Idempotent: rewrites
 # and reloads only when the plist content changed or the agent isn't loaded;
 # --restart also restarts an up-to-date agent.
+#
+# The agent runs a private copy of this script, refreshed only here (i.e. on
+# add/gui/chooser). Pointing it at $SCRIPT_PATH would make a `git pull` in the
+# checkout go live within seconds without an install, and the plist would
+# flip between the repo and app-bundle copies depending on who ran last.
+WATCH_SCRIPT="$APP_SUPPORT/claude-desktop-profiles/cdp"
 install_watchdog() {
-  local quiet="${1:-}" restart="${2:-}" tmp
+  local quiet="${1:-}" restart="${2:-}" tmp xml_script
+  if [[ "$SCRIPT_PATH" != "$WATCH_SCRIPT" ]] && ! cmp -s "$SCRIPT_PATH" "$WATCH_SCRIPT"; then
+    mkdir -p "${WATCH_SCRIPT:h}"
+    cp "$SCRIPT_PATH" "$WATCH_SCRIPT.tmp" && chmod 755 "$WATCH_SCRIPT.tmp" && mv -f "$WATCH_SCRIPT.tmp" "$WATCH_SCRIPT"
+  fi
+  xml_script="${${${WATCH_SCRIPT//&/&amp;}//</&lt;}//>/&gt;}"
   tmp=$(mktemp)
   cat > "$tmp" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -742,7 +810,7 @@ install_watchdog() {
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/zsh</string>
-		<string>$SCRIPT_PATH</string>
+		<string>$xml_script</string>
 		<string>watch</string>
 	</array>
 	<key>RunAtLoad</key><true/>
@@ -768,7 +836,7 @@ EOF
 
 uninstall_watchdog() {
   launchctl bootout "gui/$(id -u)/$WATCH_LABEL" 2>/dev/null || true
-  rm -f "$WATCH_PLIST"
+  rm -f "$WATCH_PLIST" "$WATCH_SCRIPT"
   ok "Watchdog removed."
 }
 
@@ -794,11 +862,12 @@ cmd_color() {
   local raw="${1:-}" color="${2:-}"
   [[ -n "$raw" && -n "$color" ]] || err "Usage: cdp color <name> <color>   Available: ${(k)HUES}"
   [[ -n "${HUES[$color]+x}" ]] || err "Unknown color '$color'. Available: ${(k)HUES}"
-  local display data_dir app_path claude_app
-  display=$(displayify "$(slugify "$raw")")
+  local slug display data_dir app_path claude_app
+  slug=$(profile_slug "$raw") || exit 1
+  display=$(displayify "$slug")
   data_dir="$APP_SUPPORT/Claude-$display"
   app_path="$LAUNCHER_DIR/Claude $display.app"
-  [[ -d "$data_dir" ]] || err "Profile '$display' not found."
+  is_profile_dir "$data_dir" || err "Profile '$display' not found."
   claude_app=$(find_claude_app)
 
   print -- "$color" > "$data_dir/.cdp-color"
@@ -883,7 +952,7 @@ EOF
 
 cmd_list() {
   local d found=0
-  for d in "$APP_SUPPORT"/Claude-*(N/); do
+  for d in ${(f)"$(profile_dirs)"}; do
     found=1
     local display="${${d:t}#Claude-}"
     local app="$LAUNCHER_DIR/Claude $display.app"
@@ -899,8 +968,9 @@ cmd_list() {
 cmd_remove() {
   local raw="${1:-}" mode="${2:-}"
   [[ -n "$raw" ]] || err "Usage: cdp remove <name> [--keep-data|--delete-data]"
-  local display data_dir app_path
-  display=$(displayify "$(slugify "$raw")")
+  local slug display data_dir app_path
+  slug=$(profile_slug "$raw") || exit 1
+  display=$(displayify "$slug")
   data_dir="$APP_SUPPORT/Claude-$display"
   app_path="$LAUNCHER_DIR/Claude $display.app"
 
@@ -909,7 +979,10 @@ cmd_remove() {
   local clone="$CLONES_DIR/Claude $display.app"
   [[ -d "$clone" ]] && { rm -rf "$clone"; ok "Deleted profile app clone" }
 
-  if [[ -d "$data_dir" ]]; then
+  # Never delete a folder cdp didn't create, whatever --delete-data says.
+  if [[ -d "$data_dir" ]] && ! is_profile_dir "$data_dir"; then
+    warn "$data_dir was not created by cdp (no .cdp-color); leaving it alone."
+  elif [[ -d "$data_dir" ]]; then
     case "$mode" in
       --delete-data)
         rm -rf "$data_dir"
