@@ -330,7 +330,7 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Image(nsImage: claudeIcon)
+            Image(nsImage: NSApp.applicationIconImage)
                 .resizable()
                 .frame(width: 38, height: 38)
             VStack(alignment: .leading, spacing: 2) {
