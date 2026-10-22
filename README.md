@@ -24,8 +24,11 @@ and click **Open Anyway** next to the Claude Profiles message.
 <img src="docs/images/open-anyway.png" width="484" alt="Privacy & Security settings with the Open Anyway button">
 
 macOS asks one last time. Click **Open Anyway** again and confirm with your
-password or Touch ID. You do this once per version; from then on it opens like
-any other app.
+password or Touch ID.
+
+<img src="docs/images/open-anyway-confirm.png" width="300" alt="macOS dialog: Open “Claude Profiles”? with the Open Anyway button">
+
+You do this once per version; from then on it opens like any other app.
 
 > **Prefer the Terminal?** This does the same as step 3:
 > ```sh
