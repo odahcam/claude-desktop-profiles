@@ -3,8 +3,7 @@
 **Run multiple Claude Desktop accounts side by side on macOS** — work and
 personal, or one per client — with a native profile manager, Spotlight
 launchers, and a tiny CLI. No Electron, no npm, no telemetry, no network
-calls. Built locally on your machine from ~700 lines of code you can read
-in one sitting.
+calls. About 1,700 lines of shell and Swift you can read in one sitting.
 
 ![Claude Profiles window](docs/screenshot.png)
 
@@ -53,15 +52,52 @@ the `cdp` script and shells out to it.
 
 ## Install
 
+**1. Download.** Get **Claude-Profiles.zip** from the [latest release](../../releases/latest).
+
+**2. Move to Applications.** Double-click the zip, then drag **Claude Profiles.app**
+into your **Applications** folder.
+
+**3. Open it the first time.** The app isn't notarized, so macOS blocks the first
+launch with "“Claude Profiles” Not Opened". Click **Done**, open **System Settings →
+Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to
+the Claude Profiles message. Confirm with **Open Anyway** and your password or
+Touch ID. You only do this once per version.
+
+> **Prefer the Terminal?** This does the same as step 3:
+> ```sh
+> xattr -dr com.apple.quarantine "/Applications/Claude Profiles.app"
+> ```
+
+On first launch the app sets up the watchdog and brings any existing profile
+launchers up to its version. Needs macOS 13 or later (Apple Silicon or Intel) and
+Claude Desktop in `/Applications`.
+
+**Command line (optional).** The `cdp` CLI ships inside the app:
+
+```sh
+sudo mkdir -p /usr/local/bin
+sudo ln -sf "/Applications/Claude Profiles.app/Contents/Resources/cdp" /usr/local/bin/cdp
+```
+
+**Upgrading from a source install (`./install.sh`)?** Delete
+`~/Applications/Claude Profiles.app` after installing the download, so Spotlight
+shows one copy. Profiles, launchers and colors are kept.
+
+### Build from source
+
+Needs the Xcode Command Line Tools (`xcode-select --install`).
+
 ```sh
 git clone https://github.com/odahcam/claude-desktop-profiles.git
 cd claude-desktop-profiles
 ./install.sh
 ```
 
-The installer compiles the app locally (Swift toolchain via Xcode Command
-Line Tools; it falls back to the AppleScript picker without it) and links
-`cdp` onto your PATH. Nothing is downloaded at build time.
+The installer compiles the app into `~/Applications` (it falls back to the
+AppleScript picker without a Swift toolchain) and links `cdp` onto your PATH.
+`scripts/build.sh` builds the release zip; `scripts/test.sh` builds it, checks
+the bundle, and runs the first-launch setup of a quarantined copy in a
+throwaway `HOME`.
 
 ## Usage
 
@@ -74,6 +110,7 @@ cdp color personal teal         # change the profile's color
 cdp list                        # profiles and launcher health
 cdp watchdog status             # LaunchAgent state + clones running off-profile
 cdp remove personal             # remove launcher; asks before touching data
+cdp setup                       # point launchers + watchdog at this cdp
 cdp gui                         # (re)build + install the SwiftUI app
 cdp chooser                     # build the AppleScript picker instead
 ```
@@ -182,8 +219,10 @@ instance within seconds and relaunches the profile properly, which also
 restores the color the update wiped from the clone (`cdp` re-applies the
 Finder icon without touching the newer bundle).
 
-**Without Xcode Command Line Tools?** Everything still works; icons stay
-orange (tinting and PID-focus need the small cached Swift helper). 
+**Without Xcode Command Line Tools?** The downloaded app doesn't need them:
+it ships the small Swift helper that does tinting and PID-focus prebuilt. A
+source install without them falls back to the AppleScript picker, and icons
+stay orange.
 
 ## Acknowledgments
 

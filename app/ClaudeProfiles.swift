@@ -208,6 +208,21 @@ final class ProfileStore: ObservableObject {
         callCdp(["remove", p.name, deleteData ? "--delete-data" : "--keep-data"])
     }
 
+    // A new version's first launch points launchers, watchdog and helper at
+    // this app's cdp. Off the main thread: rebuilding launchers takes seconds.
+    func setUp() {
+        guard let cdp = cdpPath else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var failure: String?
+            do { try runTool("/bin/zsh", [cdp, "setup", "--if-needed"], env: ["CDP_FROM_CHOOSER": "1"]) }
+            catch { failure = error.localizedDescription }
+            DispatchQueue.main.async {
+                if let failure { self.errorMessage = failure }
+                self.refresh()
+            }
+        }
+    }
+
     private func callCdp(_ args: [String]) {
         guard let cdp = cdpPath else {
             errorMessage = "Bundled cdp script is missing from the app. Rebuild with: cdp gui"
@@ -274,7 +289,7 @@ struct ContentView: View {
         }
         .frame(minWidth: 580, idealWidth: 640, minHeight: 380, idealHeight: 420)
         .background(WindowBackground())
-        .onAppear { store.refresh() }
+        .onAppear { store.refresh(); store.setUp() }
         .onReceive(timer) { _ in store.refreshRunning() }
         .sheet(isPresented: $showAdd) {
             AddSheet { name, color in store.add(name, color: color) }

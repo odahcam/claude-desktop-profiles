@@ -25,6 +25,8 @@ set -euo pipefail
 # (FUNCTION_ARGZERO), which would break the self-copy into the chooser bundle.
 SCRIPT_PATH="${0:A}"
 
+CDP_VERSION="0.4.0"
+
 APP_SUPPORT="$HOME/Library/Application Support"
 LAUNCHER_DIR="$HOME/Applications"
 BUNDLE_PREFIX="com.claude-desktop-profiles"
@@ -35,7 +37,7 @@ CACHE_DIR="$HOME/Library/Caches/claude-desktop-profiles"
 CLONES_DIR="$APP_SUPPORT/claude-desktop-profiles/apps"
 # LaunchAgent running `cdp watch`: re-homes clones that got relaunched
 # without their --user-data-dir (see adopt_strays).
-WATCH_LABEL="$BUNDLE_PREFIX.watch"
+WATCH_LABEL="${CDP_WATCH_LABEL:-$BUNDLE_PREFIX.watch}"  # override: tests
 WATCH_PLIST="$HOME/Library/LaunchAgents/$WATCH_LABEL.plist"
 
 # Per-profile icon colors: hue rotation (degrees) applied to Claude's icon.
@@ -79,8 +81,40 @@ displayify() {
   print -- "${(j: :)out}"
 }
 
-# Compiles (and caches) a small Swift helper for icon tinting, Finder icons
-# and window focus. Needs swiftc; callers fall back without it.
+# The manager app ("Claude Profiles"): the downloaded release in
+# /Applications or a local build in ~/Applications. Prefers the copy running
+# this script, so launchers and CLI symlinks find the same one.
+manager_app() {
+  local c
+  for c in "${SCRIPT_PATH:h:h:h}" "/Applications/$CHOOSER_NAME.app" "$LAUNCHER_DIR/$CHOOSER_NAME.app"; do
+    [[ "${c:t}" == "$CHOOSER_NAME.app" && -d "$c" ]] && { print -- "$c"; return 0 }
+  done
+  return 1
+}
+
+# The SwiftUI manager, as opposed to the AppleScript chooser at the same name.
+is_swiftui_manager() {
+  [[ -x "$1/Contents/MacOS/ClaudeProfiles" ]]
+}
+
+# Compiles Swift sources into one binary for each arch in $CDP_ARCHS (default:
+# this Mac's), merged with lipo. The release sets CDP_ARCHS="arm64 x86_64".
+swift_compile() {
+  local out="$1" arch
+  shift
+  local -a slices=()
+  for arch in ${=CDP_ARCHS:-$(uname -m)}; do
+    swiftc -O -target "$arch-apple-macos13.0" -o "$out.$arch" "$@" || return 1
+    slices+=("$out.$arch")
+  done
+  lipo -create -output "$out" $slices
+  rm -f $slices
+}
+
+# Caches the small Swift helper for icon tinting, Finder icons and window
+# focus. Release builds ship it prebuilt inside the manager app, so no Xcode
+# tools are needed; otherwise it is compiled, which needs swiftc. Callers fall
+# back without it.
 #
 # It lives inside a minimal .app bundle, not as a bare binary: macOS names a
 # process after the bundle it runs from, so Activity Monitor, TCC prompts and
@@ -96,8 +130,30 @@ ensure_tint_tool() {
     print -- "$tool"
     return 0
   fi
+  local m prebuilt
+  m=$(manager_app) && prebuilt="$m/Contents/Resources/$HELPER_NAME.app"
+  if [[ -n "$prebuilt" && -x "$prebuilt/Contents/MacOS/$HELPER_NAME" ]]; then
+    # The copy drops the download's quarantine flag: launchers exec the
+    # helper outside the manager app the user approved in Gatekeeper, and
+    # macOS kills a quarantined, unnotarized binary on exec. ditto --noqtn
+    # does not remove it.
+    rm -rf "$bundle"
+    mkdir -p "$CACHE_DIR"
+    ditto "$prebuilt" "$bundle"
+    xattr -dr com.apple.quarantine "$bundle" 2>/dev/null || true
+    touch "$tool"
+  else
+    build_helper "$bundle" 2>/dev/null || return 1
+  fi
+  helper_icon "$tool" "$icns"
+  print -- "$tool"
+}
+
+# Writes the helper .app bundle to $1. Needs swiftc.
+build_helper() {
+  local bundle="$1" tmp
+  local tool="$bundle/Contents/MacOS/$HELPER_NAME"
   command -v swiftc >/dev/null 2>&1 || return 1
-  local tmp
   tmp=$(mktemp -d)
   cat > "$tmp/helper.swift" <<'EOF'
 import AppKit
@@ -198,8 +254,9 @@ try! p.run(); p.waitUntilExit()
 try? FileManager.default.removeItem(at: iconset)
 exit(p.terminationStatus)
 EOF
+  rm -rf "$bundle"
   mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-  swiftc -O -o "$tool" "$tmp/helper.swift" 2>/dev/null || { rm -rf "$tmp"; return 1 }
+  swift_compile "$tool" "$tmp/helper.swift" || { rm -rf "$tmp"; return 1 }
   rm -rf "$tmp"
   cat > "$bundle/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -214,17 +271,18 @@ EOF
 	<key>LSUIElement</key><true/>
 </dict></plist>
 EOF
-  helper_icon "$tool" "$icns"
-  print -- "$tool"
+  /usr/bin/codesign --force --sign - "$bundle" 2>/dev/null
 }
 
 # The helper's own icon is the same multi-hue grid as the manager app. Skipped
-# silently when Claude.app is missing; retried on the next call.
+# silently when Claude.app is missing; retried on the next call. Re-signs the
+# bundle, whose seal the new resource broke.
 helper_icon() {
   local tool="$1" out="$2" claude_app src
   claude_app=$(find_claude_app 2>/dev/null) || return 0
   src=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
-  [[ -n "$src" ]] && "$tool" grid "$src" "$out" 2>/dev/null || true
+  [[ -n "$src" ]] && "$tool" grid "$src" "$out" 2>/dev/null &&
+    /usr/bin/codesign --force --sign - "${tool:h:h:h}" 2>/dev/null || true
 }
 
 # Writes the profile icon (hue-rotated when hue != 0 and swiftc is available,
@@ -464,7 +522,8 @@ profile_dirs() {
 # app — rebuilding would silently downgrade it to the AppleScript dialog.
 rebuild_chooser_unless_nested() {
   [[ "${CDP_FROM_CHOOSER:-}" == "1" ]] && return 0
-  [[ -x "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/MacOS/ClaudeProfiles" ]] && return 0
+  local m
+  m=$(manager_app) && is_swiftui_manager "$m" && return 0
   cmd_chooser --quiet
 }
 
@@ -491,9 +550,17 @@ EOF
 
   # Bundle cdp so the launcher drives the same launch path as the GUI and
   # CLI, then re-sign (the copy broke the seal).
-  cp "$SCRIPT_PATH" "$app_path/Contents/Resources/cdp"
-  chmod +x "$app_path/Contents/Resources/cdp"
+  bundle_cdp "$app_path"
   /usr/bin/codesign --force --sign - "$app_path" 2>/dev/null || true
+}
+
+# Copies this script into the bundle's Resources. A cdp from the downloaded
+# app carries its quarantine flag, which every copy inherits (even cp -X).
+bundle_cdp() {
+  local dst="$1/Contents/Resources/cdp"
+  cp "$SCRIPT_PATH" "$dst"
+  chmod +x "$dst"
+  xattr -d com.apple.quarantine "$dst" 2>/dev/null || true
 }
 
 # Every installed piece carries a copy of (or runs) this script: the manager
@@ -562,10 +629,12 @@ cmd_add() {
 }
 
 cmd_chooser() {
-  local claude_app tmp
-  # Same bundle path as the SwiftUI app: building here would replace the GUI.
-  [[ "${1:-}" == "--force" || ! -x "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/MacOS/ClaudeProfiles" ]] ||
-    err "The SwiftUI app is installed at $LAUNCHER_DIR/$CHOOSER_NAME.app; 'cdp chooser' would replace it. Use 'cdp gui' to rebuild it, or 'cdp chooser --force'."
+  local claude_app tmp m
+  # Same Spotlight name as the SwiftUI app: building here would replace or
+  # duplicate the GUI.
+  if [[ "${1:-}" != "--force" ]] && m=$(manager_app) && is_swiftui_manager "$m"; then
+    err "The SwiftUI app is installed at $m; 'cdp chooser' would replace or duplicate it. Use 'cdp chooser --force' to build it anyway."
+  fi
   claude_app=$(find_claude_app)
   tmp=$(mktemp -d)
 
@@ -656,8 +725,7 @@ EOF
 
   # Bundle this script so the chooser's add/remove buttons drive the exact
   # same code path as the CLI, then re-sign (the copy broke the seal again).
-  cp "$SCRIPT_PATH" "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/Resources/cdp"
-  chmod +x "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/Resources/cdp"
+  bundle_cdp "$LAUNCHER_DIR/$CHOOSER_NAME.app"
   make_manager_icns "$claude_app" "$LAUNCHER_DIR/$CHOOSER_NAME.app/Contents/Resources/applet.icns" || true
   /usr/bin/codesign --force --sign - "$LAUNCHER_DIR/$CHOOSER_NAME.app" 2>/dev/null || true
   sync_install
@@ -820,27 +888,23 @@ cmd_color() {
   fi
 }
 
-cmd_gui() {
-  # Compiles app/ClaudeProfiles.swift into a real .app, replacing the
-  # AppleScript chooser at the same Spotlight name. Built locally on the
-  # user's machine, so there is no notarization/quarantine problem.
+# Builds the SwiftUI manager app at $1 from a repo checkout: the GUI, a copy
+# of this script and the prebuilt helper, ad-hoc signed. Used by `cdp gui`
+# and by scripts/build.sh for the release.
+build_manager_app() {
+  local bundle="$1"
   command -v swiftc >/dev/null 2>&1 ||
     err "swiftc not found. Install Xcode Command Line Tools (xcode-select --install), or use 'cdp chooser' for the dialog-based picker."
-  local repo_root="${SCRIPT_PATH:h:h}"
-  local src="$repo_root/app/ClaudeProfiles.swift"
+  local src="${SCRIPT_PATH:h:h}/app/ClaudeProfiles.swift"
   [[ -f "$src" ]] ||
     err "GUI source not found at $src — run cdp from a repo checkout to build the GUI."
 
-  local claude_app app tmp bundle
-  claude_app=$(find_claude_app)
-  app="$LAUNCHER_DIR/$CHOOSER_NAME.app"
-  tmp=$(mktemp -d)
-  bundle="$tmp/$CHOOSER_NAME.app"
+  rm -rf "$bundle"
   mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-
   info "Compiling ClaudeProfiles.swift (first build can take ~30s)…"
-  swiftc -O -parse-as-library -target "$(uname -m)-apple-macos13.0" \
-    -o "$bundle/Contents/MacOS/ClaudeProfiles" "$src"
+  swift_compile "$bundle/Contents/MacOS/ClaudeProfiles" -parse-as-library "$src" ||
+    err "Compiling ClaudeProfiles.swift failed."
+  build_helper "$bundle/Contents/Resources/$HELPER_NAME.app" || err "Compiling the helper failed."
 
   cat > "$bundle/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -853,21 +917,33 @@ cmd_gui() {
 	<key>CFBundleExecutable</key><string>ClaudeProfiles</string>
 	<key>CFBundleIconFile</key><string>AppIcon</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
-	<key>CFBundleShortVersionString</key><string>1.0.0</string>
+	<key>CFBundleShortVersionString</key><string>$CDP_VERSION</string>
+	<key>CFBundleVersion</key><string>$CDP_VERSION</string>
 	<key>LSMinimumSystemVersion</key><string>13.0</string>
 	<key>NSHighResolutionCapable</key><true/>
 </dict>
 </plist>
 EOF
 
-  make_manager_icns "$claude_app" "$bundle/Contents/Resources/AppIcon.icns" || true
-
   # Same trick as the chooser: bundle this script so the GUI's add/remove
   # drive the exact same code path as the CLI.
-  cp "$SCRIPT_PATH" "$bundle/Contents/Resources/cdp"
-  chmod +x "$bundle/Contents/Resources/cdp"
+  bundle_cdp "$bundle"
+  cp "${SCRIPT_PATH:h:h}/app/AppIcon.icns" "$bundle/Contents/Resources/AppIcon.icns"
+  cp "${SCRIPT_PATH:h:h}/app/AppIcon.icns" "$bundle/Contents/Resources/$HELPER_NAME.app/Contents/Resources/AppIcon.icns"
+  /usr/bin/codesign --force --sign - "$bundle/Contents/Resources/$HELPER_NAME.app"
 
-  /usr/bin/codesign --force --sign - "$bundle" 2>/dev/null || true
+  /usr/bin/codesign --force --sign - "$bundle"
+}
+
+cmd_gui() {
+  # Builds the SwiftUI manager into ~/Applications, replacing the AppleScript
+  # chooser at the same Spotlight name. Built locally on the user's machine,
+  # so there is no notarization/quarantine problem.
+  local app tmp bundle
+  app="$LAUNCHER_DIR/$CHOOSER_NAME.app"
+  tmp=$(mktemp -d)
+  bundle="$tmp/$CHOOSER_NAME.app"
+  build_manager_app "$bundle"
 
   mkdir -p "$LAUNCHER_DIR"
   # A running GUI keeps executing the replaced binary; restart it on the new one.
@@ -879,6 +955,21 @@ EOF
   sync_install
   (( running )) && open "$app"
   ok "GUI installed: $app  (Spotlight: '$CHOOSER_NAME')"
+}
+
+# Run by the manager app on every launch: the first time a version runs from
+# a location (a fresh download, an update), points launchers, watchdog and
+# helper at this copy of cdp.
+cmd_setup() {
+  # An app opened straight from Downloads runs from a randomized read-only
+  # copy that vanishes on quit; the watchdog would point at nothing.
+  [[ "$SCRIPT_PATH" != */AppTranslocation/* ]] ||
+    err "Move Claude Profiles to your Applications folder, then open it again."
+  local stamp="$CACHE_DIR/setup" want="$CDP_VERSION $SCRIPT_PATH"
+  [[ "${1:-}" == "--if-needed" && "$(cat "$stamp" 2>/dev/null)" == "$want" ]] && return 0
+  sync_install
+  mkdir -p "$CACHE_DIR"
+  print -- "$want" > "$stamp"
 }
 
 cmd_list() {
@@ -961,6 +1052,9 @@ USAGE
   cdp chooser         Build the AppleScript picker instead — zero build
                       requirements, same Spotlight name, fewer looks;
                       refuses to replace the SwiftUI app without --force
+  cdp setup           Rebuild launchers, watchdog and helper from this cdp
+                      (the app runs it when a new version first opens)
+  cdp version         Print the version
   cdp help            This text
 
 Profiles live in ~/Library/Application Support/Claude-<Name>; that profile's
@@ -981,6 +1075,9 @@ case "${1:-help}" in
   remove)  shift; cmd_remove "$@" ;;
   gui)     cmd_gui ;;
   chooser) shift; cmd_chooser "$@" ;;
+  setup)   shift; cmd_setup "$@" ;;
+  build)   shift; build_manager_app "${1:?Usage: cdp build <out.app>}" ;;
+  version|--version) print -- "$CDP_VERSION" ;;
   help|-h|--help) cmd_help ;;
   *) err "Unknown command: $1 (try: cdp help)" ;;
 esac
