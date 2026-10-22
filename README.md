@@ -1,54 +1,10 @@
-# Claude Desktop Profiles
+<h1><img src="docs/images/icon.png" width="40" align="top" alt=""> Claude Profiles</h1>
 
-**Run multiple Claude Desktop accounts side by side on macOS** — work and
-personal, or one per client — with a native profile manager, Spotlight
-launchers, and a tiny CLI. No Electron, no npm, no telemetry, no network
-calls. About 1,700 lines of shell and Swift you can read in one sitting.
+Run several Claude Desktop accounts side by side on your Mac: work and personal,
+or one per client. Each profile has its own login, chats, settings and color, and
+its own launcher in Spotlight and the Dock.
 
 ![Claude Profiles window](docs/screenshot.png)
-
-## Why
-
-Claude Desktop supports exactly one logged-in account. If you have a Team
-account at work and a personal account for your own projects, you're stuck
-logging out and back in — losing context every time. Claude Desktop is an
-Electron app, though, and honors Chromium's `--user-data-dir` flag: point it
-at a different folder and you get a **fully isolated instance** — its own
-login, chats, settings, projects, and MCP connectors. This project wraps that
-one flag in a native macOS experience.
-
-## What you get
-
-- **Per-profile colors, all the way to the Dock** — each profile gets a
-  color (orange, red, yellow, green, teal, blue, purple, pink), and the
-  running instance's Dock tile actually wears it: profiles launch from
-  their own APFS clone of Claude.app carrying a hue-tinted Finder icon, so
-  the window lives under the colored tile. Anthropic's code signature stays
-  intact (Finder icons are metadata), so login/Keychain keep working.
-- **Claude Profiles app** — a SwiftUI window with a card per profile:
-  live running indicators, one-click launch/focus, color picker, add and
-  remove built in. ⌘Space → "Claude Profiles".
-- **Per-profile Spotlight launchers** — every profile also gets its own
-  "Claude Work.app" / "Claude Personal.app" launcher in its color;
-  clicking one launches the profile or focuses it if already running
-  (never a stray extra window).
-- **A CLI (`cdp`)** — `cdp add personal --color blue`, `cdp launch personal`,
-  `cdp color personal teal`, `cdp list`, `cdp remove`, for scripting and
-  dotfiles people.
-- **AppleScript fallback** — no Xcode Command Line Tools? `cdp chooser`
-  builds a zero-dependency dialog picker (plain icons, same profiles).
-
-Running profiles wear their colors in the Dock — each window lives under
-its profile's tile:
-
-![Colored Dock tiles for running profiles](docs/dock.png)
-
-And every launcher is a first-class Spotlight citizen:
-
-![Colored profile launchers in Spotlight](docs/spotlight.png)
-
-All three frontends drive the same implementation: the GUI bundles a copy of
-the `cdp` script and shells out to it.
 
 ## Install
 
@@ -57,51 +13,73 @@ the `cdp` script and shells out to it.
 **2. Move to Applications.** Double-click the zip, then drag **Claude Profiles.app**
 into your **Applications** folder.
 
-**3. Open it the first time.** The app isn't notarized, so macOS blocks the first
-launch with "“Claude Profiles” Not Opened". Click **Done**, open **System Settings →
-Privacy & Security**, scroll down to **Security**, and click **Open Anyway** next to
-the Claude Profiles message. Confirm with **Open Anyway** and your password or
-Touch ID. You only do this once per version.
+**3. Open it the first time.** Claude Profiles isn't from the App Store, so macOS
+stops the first launch with this message. Click **Done**.
+
+<img src="docs/images/gatekeeper-blocked.png" width="260" alt="macOS dialog: “Claude Profiles” Not Opened">
+
+Then open **System Settings → Privacy & Security**, scroll down to **Security**,
+and click **Open Anyway** next to the Claude Profiles message.
+
+<img src="docs/images/open-anyway.png" width="484" alt="Privacy & Security settings with the Open Anyway button">
+
+macOS asks one last time. Click **Open Anyway** again and confirm with your
+password or Touch ID. You do this once per version; from then on it opens like
+any other app.
 
 > **Prefer the Terminal?** This does the same as step 3:
 > ```sh
 > xattr -dr com.apple.quarantine "/Applications/Claude Profiles.app"
 > ```
 
-On first launch the app sets up the watchdog and brings any existing profile
-launchers up to its version. Needs macOS 13 or later (Apple Silicon or Intel) and
-Claude Desktop in `/Applications`.
+**4. Create a profile.** Click **New Profile**, give it a name and a color. It
+shows up in Spotlight as "Claude <Name>".
 
-**Command line (optional).** The `cdp` CLI ships inside the app:
+**5. Sign in — read this once.** Claude's login hands the auth token over a
+`claude://` link, and macOS sends that link to **whichever Claude is running**.
+The first time you open a new profile, quit every other Claude window (⌘Q), then
+open the profile and sign in. After that, all profiles run at the same time. If
+the token ever lands on the wrong instance, no data is lost: sign that instance
+back into its own account.
+
+### What you need
+
+- A Mac with macOS 13 or later (Apple Silicon or Intel)
+- [Claude Desktop](https://claude.ai/download) in `/Applications`
+
+### Upgrading
+
+Download the new zip and replace the app in Applications. On its first launch it
+updates your launchers and the watchdog to the new version. Coming from a source
+install (`./install.sh`)? Delete `~/Applications/Claude Profiles.app`, so
+Spotlight shows one copy. Profiles, launchers and colors are kept.
+
+## What it does
+
+- **One isolated Claude per profile**: its own login, chats, settings, projects,
+  MCP connectors, and its own Claude Code config for the Code and Cowork tabs.
+- **Colors all the way to the Dock**: orange, red, yellow, green, teal, blue,
+  purple or pink. The running profile's Dock tile wears its color.
+- **A launcher per profile in Spotlight**: "Claude Work", "Claude Personal".
+  Clicking one opens the profile, or brings it forward if it's already open.
+- **The Claude Profiles window**: a card per profile with running status,
+  launch/focus, color, and add/remove.
+- **Profiles update themselves**: each one installs Claude's updates on its own
+  schedule, and a watchdog puts it back on its profile when an update relaunches it.
+- **A CLI (`cdp`)** for scripting, shipped inside the app.
+
+![Colored Dock tiles for running profiles](docs/dock.png)
+
+![Colored profile launchers in Spotlight](docs/spotlight.png)
+
+## Command line
+
+The `cdp` CLI ships inside the app. To put it on your PATH:
 
 ```sh
 sudo mkdir -p /usr/local/bin
 sudo ln -sf "/Applications/Claude Profiles.app/Contents/Resources/cdp" /usr/local/bin/cdp
 ```
-
-**Upgrading from a source install (`./install.sh`)?** Delete
-`~/Applications/Claude Profiles.app` after installing the download, so Spotlight
-shows one copy. Profiles, launchers and colors are kept.
-
-### Build from source
-
-Needs the Xcode Command Line Tools (`xcode-select --install`).
-
-```sh
-git clone https://github.com/odahcam/claude-desktop-profiles.git
-cd claude-desktop-profiles
-./install.sh
-```
-
-The installer compiles the app into `~/Applications` (it falls back to the
-AppleScript picker without a Swift toolchain) and links `cdp` onto your PATH.
-`scripts/build.sh` builds the release zip; `scripts/test.sh` builds it, checks
-the bundle, and runs the first-launch setup of a quarantined copy in a
-throwaway `HOME`.
-
-## Usage
-
-⌘Space → "Claude Profiles" → **New profile**. Or:
 
 ```sh
 cdp add personal --color blue   # create profile + Spotlight launcher
@@ -111,24 +89,26 @@ cdp list                        # profiles and launcher health
 cdp watchdog status             # LaunchAgent state + clones running off-profile
 cdp remove personal             # remove launcher; asks before touching data
 cdp setup                       # point launchers + watchdog at this cdp
-cdp gui                         # (re)build + install the SwiftUI app
-cdp chooser                     # build the AppleScript picker instead
+cdp version
 ```
 
-## Signing in to a new profile — read this once
+The window, the launchers and the CLI all run the same `cdp` script.
 
-Claude's login hands the auth token over a `claude://` deep link, and macOS
-routes that link to **whichever Claude instance is running**. The first time
-you launch a new profile:
+## Data and privacy
 
-1. Quit every other Claude window (⌘Q).
-2. Launch the new profile and sign in.
-3. Done — from now on all profiles run simultaneously without conflict.
-
-If the token ever lands on the wrong instance, no data is lost — just sign
-that instance back into its own account.
+- No telemetry, no network calls. About 1,700 lines of shell and Swift you can
+  read in one sitting.
+- A profile is a folder: `~/Library/Application Support/Claude-<Name>`. Its
+  Claude Code config lives in `<profile>/claude-config`.
+- Your default Claude install is never touched. Profiles start empty and never
+  copy credentials; each signs in on its own.
 
 ## How it works
+
+Claude Desktop supports one logged-in account, but it's an Electron app and
+honors Chromium's `--user-data-dir` flag: point it at a different folder and you
+get a **fully isolated instance**. This project wraps that one flag in a native
+macOS experience.
 
 - A profile **is** a folder: `~/Library/Application Support/Claude-<Name>`.
   There is no registry, database, or state file — the GUI, the chooser, and
@@ -223,6 +203,30 @@ Finder icon without touching the newer bundle).
 it ships the small Swift helper that does tinting and PID-focus prebuilt. A
 source install without them falls back to the AppleScript picker, and icons
 stay orange.
+
+## Build from source
+
+Needs the Xcode Command Line Tools (`xcode-select --install`).
+
+```sh
+git clone https://github.com/odahcam/claude-desktop-profiles.git
+cd claude-desktop-profiles
+./install.sh
+```
+
+The installer compiles the app into `~/Applications` (it falls back to the
+AppleScript picker without a Swift toolchain) and links `cdp` onto your PATH.
+`cdp gui` rebuilds the app, `cdp chooser` builds the AppleScript picker instead.
+
+## Tests
+
+```sh
+scripts/build.sh   # build/Claude Profiles.app and build/Claude-Profiles.zip (universal)
+scripts/test.sh    # builds, checks the bundle, then runs the first-launch setup
+                   # of a quarantined copy in a throwaway HOME
+```
+
+The tests never touch your real `~/Applications`, profiles or watchdog.
 
 ## Acknowledgments
 
