@@ -25,7 +25,7 @@ set -euo pipefail
 # (FUNCTION_ARGZERO), which would break the self-copy into the chooser bundle.
 SCRIPT_PATH="${0:A}"
 
-CDP_VERSION="0.4.2"
+CDP_VERSION="0.4.3"
 
 APP_SUPPORT="$HOME/Library/Application Support"
 LAUNCHER_DIR="$HOME/Applications"
@@ -159,8 +159,8 @@ build_helper() {
 import AppKit
 import CoreImage
 
-// helper tint <src.icns> <dst.icns> <hueDegrees>   hue-rotated copy
-// helper grid <src.icns> <dst.icns>                quartered multi-hue manager icon
+// helper tint <src.app|.icns> <dst.icns> <hueDegrees>   hue-rotated copy
+// helper grid <src.app|.icns> <dst.icns>                quartered multi-hue manager icon
 // helper seticon <icon> <target>                   Finder custom icon (Dock honors it,
 //                                                  and it does not break code signatures)
 // helper focus <pid>                               activate a running app by pid
@@ -178,7 +178,18 @@ if mode == "seticon" {
     guard a.count >= 4, let img = NSImage(contentsOfFile: a[2]) else { exit(2) }
     exit(NSWorkspace.shared.setIcon(img, forFile: a[3], options: []) ? 0 : 3)
 }
-guard a.count >= 4, let src = NSImage(contentsOfFile: a[2]) else { exit(2) }
+// A .app source is read through NSWorkspace: Claude's current icon lives in
+// its Assets.car, already in the system squircle. The bundle's only .icns
+// (electron.icns) is a legacy, squarer icon; tinting that made the clones'
+// Dock tiles squarer than Claude's own and the launchers'.
+guard a.count >= 4 else { exit(2) }
+let src: NSImage
+if a[2].hasSuffix(".app") {
+    src = NSWorkspace.shared.icon(forFile: a[2])
+} else {
+    guard let img = NSImage(contentsOfFile: a[2]) else { exit(2) }
+    src = img
+}
 let dst = a[3]
 let iconset = URL(fileURLWithPath: NSTemporaryDirectory())
     .appendingPathComponent("tint-\(ProcessInfo.processInfo.processIdentifier).iconset")
@@ -278,25 +289,24 @@ EOF
 # silently when Claude.app is missing; retried on the next call. Re-signs the
 # bundle, whose seal the new resource broke.
 helper_icon() {
-  local tool="$1" out="$2" claude_app src
+  local tool="$1" out="$2" claude_app
   claude_app=$(find_claude_app 2>/dev/null) || return 0
-  src=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
-  [[ -n "$src" ]] && "$tool" grid "$src" "$out" 2>/dev/null &&
+  "$tool" grid "$claude_app" "$out" 2>/dev/null &&
     /usr/bin/codesign --force --sign - "${tool:h:h:h}" 2>/dev/null || true
 }
 
-# Writes the profile icon (hue-rotated when hue != 0 and swiftc is available,
-# Claude's own icon otherwise) to the given path. Returns 1 if no source icon.
+# Writes the profile icon to the given path: Claude's current icon (from the
+# app, not its legacy .icns), hue-rotated when hue != 0. Hue 0 still goes
+# through the helper so orange profiles get the same shape. Without the
+# helper, falls back to the bundle's .icns. Returns 1 if no source icon.
 make_icns() {
   local claude_app="$1" hue="$2" out="$3" icns tool
+  if tool=$(ensure_tint_tool) && "$tool" tint "$claude_app" "$out" "$hue" 2>/dev/null; then
+    return 0
+  fi
   icns=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
   [[ -n "$icns" ]] || return 1
-  if [[ "$hue" != "0" ]]; then
-    if tool=$(ensure_tint_tool) && "$tool" tint "$icns" "$out" "$hue" 2>/dev/null; then
-      return 0
-    fi
-    warn "Could not tint icon (swiftc missing?). Using the plain Claude icon."
-  fi
+  [[ "$hue" != "0" ]] && warn "Could not tint icon (swiftc missing?). Using the plain Claude icon."
   cp "$icns" "$out"
 }
 
@@ -305,11 +315,11 @@ make_icns() {
 # the plain Claude icon when swiftc is unavailable.
 make_manager_icns() {
   local claude_app="$1" out="$2" icns tool
-  icns=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
-  [[ -n "$icns" ]] || return 1
-  if tool=$(ensure_tint_tool) && "$tool" grid "$icns" "$out" 2>/dev/null; then
+  if tool=$(ensure_tint_tool) && "$tool" grid "$claude_app" "$out" 2>/dev/null; then
     return 0
   fi
+  icns=$(print -l -- "$claude_app/Contents/Resources"/*.icns(N) | head -1)
+  [[ -n "$icns" ]] || return 1
   cp "$icns" "$out"
 }
 
