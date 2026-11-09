@@ -362,10 +362,13 @@ config_dir_of_profile() {
 }
 
 # Starts the clone with the profile's data dir AND a private Claude Code
-# config dir. Exec'd directly instead of `open`: `open` hands LaunchServices
-# a clean env, so CLAUDE_CONFIG_DIR would never reach the app. The env is
-# reset to what launchd would give a Spotlight-launched app, so nothing from
-# the calling shell (a terminal, a Claude Code session) leaks in either.
+# config dir. Goes through LaunchServices (`open`), not a direct exec: a
+# child exec'd from the launcher applet's `do shell script` became the
+# applet's LaunchServices subordinate, so the dead applet kept a second,
+# differently tinted Dock tile ("exited-with-subordinates") for as long as
+# the clone ran. `open` gives the app launchd's env, so nothing from the
+# calling shell leaks in; CLAUDE_CONFIG_DIR goes in via --env. -n so a stray
+# of the same bundle (no --user-data-dir) is never just re-activated.
 launch_clone() {
   local clone="$1" data_dir="$2" cfg
   cfg=$(config_dir_of_profile "$data_dir")
@@ -375,13 +378,8 @@ launch_clone() {
   [[ -n "$data_dir" && -n "$cfg" ]] || err "Refusing to launch: empty data or config dir."
   [[ -x "$clone/Contents/MacOS/Claude" ]] || err "Refusing to launch: clone binary missing at $clone."
   mkdir -p "$cfg"
-  nohup /usr/bin/env -i \
-    HOME="$HOME" USER="$USER" LOGNAME="$USER" SHELL="${SHELL:-/bin/zsh}" \
-    PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-    TMPDIR="$(getconf DARWIN_USER_TEMP_DIR)" LANG="${LANG:-en_US.UTF-8}" \
-    ${SSH_AUTH_SOCK:+SSH_AUTH_SOCK="$SSH_AUTH_SOCK"} \
-    CLAUDE_CONFIG_DIR="$cfg" \
-    "$clone/Contents/MacOS/Claude" --user-data-dir="$data_dir" >/dev/null 2>&1 &!
+  /usr/bin/open -n -a "$clone" --env CLAUDE_CONFIG_DIR="$cfg" \
+    --args --user-data-dir="$data_dir"
 }
 
 # Clone processes running WITHOUT --user-data-dir, as "pid<TAB>Display".
