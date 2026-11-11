@@ -196,6 +196,21 @@ final class ProfileStore: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { self.refreshRunning() }
     }
 
+    func stop(_ p: Profile) {
+        if p.isDefault {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop") {
+                if app.bundleURL?.path == claudeAppPath {
+                    app.terminate()
+                }
+            }
+            _ = try? runTool("/usr/bin/pkill", ["-TERM", "-f", "\(claudeAppPath)/Contents/MacOS/Claude"])
+            refreshRunning()
+        } else {
+            callCdp(["stop", p.name])
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.refreshRunning() }
+    }
+
     func add(_ name: String, color: String) {
         callCdp(["add", name, "--color", color])
     }
@@ -277,6 +292,7 @@ struct ContentView: View {
                             profile: p,
                             isRunning: store.running.contains(p.id),
                             launch: { store.launch(p) },
+                            stop: { store.stop(p) },
                             reveal: { store.revealData(p) },
                             setColor: p.isDefault ? nil : { store.setColor(p, color: $0) },
                             remove: p.isDefault ? nil : { removing = p }
@@ -405,6 +421,7 @@ struct ProfileCard: View {
     let profile: Profile
     let isRunning: Bool
     let launch: () -> Void
+    let stop: () -> Void
     let reveal: () -> Void
     let setColor: ((String) -> Void)?
     let remove: (() -> Void)?
@@ -483,7 +500,10 @@ struct ProfileCard: View {
     // Shared between the right-click context menu and the ellipsis button.
     @ViewBuilder
     private var cardActions: some View {
-        Button("Launch") { launch() }
+        Button(isRunning ? "Focus" : "Launch") { launch() }
+        if isRunning {
+            Button("Quit") { stop() }
+        }
         Button("Reveal Data Folder in Finder") { reveal() }
         if let setColor {
             Menu("Change Color") {
