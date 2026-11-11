@@ -20,6 +20,7 @@
 # No dependencies beyond what ships with macOS (osacompile, PlistBuddy).
 
 set -euo pipefail
+zmodload -F zsh/stat b:zstat 2>/dev/null || true
 
 # Resolved at file scope: inside functions zsh rebinds $0 to the function name
 # (FUNCTION_ARGZERO), which would break the self-copy into the chooser bundle.
@@ -353,11 +354,19 @@ has_custom_icon() {
 }
 
 # PID of the main Claude process using this data dir (any bundle — original
-# or clone), empty when not running. The trailing `|| true` matters: under
-# `set -euo pipefail` a no-match grep (exit 1) would otherwise kill the
-# whole script at the call site's assignment.
+# or clone), empty when not running.
 instance_pid() {
-  ps -axo pid=,command= 2>/dev/null | grep -F -- "--user-data-dir=$1" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | awk '{print $1}' | head -1 || true
+  local target="$1" line pid
+  [[ -n "$target" ]] || return 0
+  ps -axo pid=,command= 2>/dev/null | while IFS= read -r line; do
+    [[ "$line" == *"/Contents/MacOS/Claude"* ]] || continue
+    [[ "$line" != *"Helper"* ]] || continue
+    if [[ "$line" == *"--user-data-dir=$target" || "$line" == *"--user-data-dir=$target "* ]]; then
+      pid="${line##[[:space:]]#}"; pid="${pid%% *}"
+      print -- "$pid"
+      return 0
+    fi
+  done || true
 }
 
 # Claude Code's config dir for this profile. --user-data-dir only scopes
@@ -399,8 +408,12 @@ launch_clone() {
 # still titled "Claude <Profile>". Args are the only thing `ps` lets us
 # check (hardened runtime hides env), and both are dropped together.
 stray_pids() {
-  local line pid cmd rest display
-  ps -axo pid=,command= 2>/dev/null | grep -F -- "$CLONES_DIR/" | grep -F "/Contents/MacOS/Claude" | grep -v Helper | grep -v grep | grep -vF -- "--user-data-dir=" | while IFS= read -r line; do
+  local line pid cmd display
+  ps -axo pid=,command= 2>/dev/null | while IFS= read -r line; do
+    [[ "$line" == *"$CLONES_DIR/"* ]] || continue
+    [[ "$line" == *"/Contents/MacOS/Claude"* ]] || continue
+    [[ "$line" != *"Helper"* ]] || continue
+    [[ "$line" != *"--user-data-dir="* ]] || continue
     pid="${line##[[:space:]]#}"; pid="${pid%% *}"
     cmd="${line#*"$CLONES_DIR/"}"
     display="${${cmd%%.app/Contents/MacOS/Claude*}#Claude }"
@@ -408,15 +421,21 @@ stray_pids() {
   done || true
 }
 
+stop_pid() {
+  local pid="$1" i
+  [[ -n "$pid" ]] || return 0
+  kill -TERM "$pid" 2>/dev/null || return 0
+  for i in {1..30}; do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.2; done
+  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+}
+
 # Quits every stray clone and relaunches it as its profile. Idempotent:
 # converges to "every clone process carries its --user-data-dir".
 adopt_strays() {
-  local entry pid display i
+  local entry pid display
   stray_pids | while IFS=$'\t' read -r pid display; do
     info "Clone '$display' is running without its profile (post-update relaunch?) — re-homing."
-    kill -TERM "$pid" 2>/dev/null || continue
-    for i in {1..30}; do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    stop_pid "$pid"
     sleep 1
     launch_profile "$display" || true
   done
@@ -775,14 +794,55 @@ launch_profile() {
   launch_clone "$clone" "$data_dir"
 }
 
+cmd_stop() {
+  local raw="${1:-}" display data_dir pid
+  [[ -n "$raw" ]] || err "Usage: cdp stop <name>"
+  display=$(displayify "$(slugify "$raw")")
+  data_dir="$APP_SUPPORT/Claude-$display"
+  [[ -d "$data_dir" ]] || err "Profile '$display' not found."
+  pid=$(instance_pid "$data_dir")
+  [[ -n "$pid" ]] || { info "Profile '$display' is not running."; return 0 }
+  stop_pid "$pid"
+  ok "Stopped '$display' (pid $pid)."
+}
+
 cmd_launch() {
   # The single launch path used by the Spotlight launchers, the GUI, and the
   # chooser. Re-homes any stray clone first so a post-update relaunch can't
   # keep serving the default account under a profile's name.
   local raw="${1:-}"
-  [[ -n "$raw" ]] || err "Usage: cdp launch <name>"
+  [[ -n "$raw" ]] || err "Usage: cdp launch <name> [--solo]"
+  if [[ "${2:-}" == "--solo" ]]; then
+    local target_display d p_display p_pid def_pid line
+    target_display=$(displayify "$(slugify "$raw")")
+    for d in "$APP_SUPPORT"/Claude-*(N/); do
+      p_display="${${d:t}#Claude-}"
+      [[ "$p_display" == "$target_display" ]] && continue
+      p_pid=$(instance_pid "$d")
+      if [[ -n "$p_pid" ]]; then
+        info "Stopping running profile '$p_display' (pid $p_pid)…"
+        stop_pid "$p_pid"
+      fi
+    done
+    ps -axo pid=,command= 2>/dev/null | while IFS= read -r line; do
+      [[ "$line" == *"/Contents/MacOS/Claude"* ]] || continue
+      [[ "$line" != *"Helper"* ]] || continue
+      [[ "$line" != *"--user-data-dir="* ]] || continue
+      [[ "$line" == *"Claude.app/Contents/MacOS/Claude"* ]] || continue
+      def_pid="${line##[[:space:]]#}"; def_pid="${def_pid%% *}"
+      if [[ -n "$def_pid" ]]; then
+        info "Stopping running Default Claude instance (pid $def_pid)…"
+        stop_pid "$def_pid"
+      fi
+    done || true
+  fi
   adopt_strays
   launch_profile "$raw"
+}
+
+file_mtime() {
+  local -a s
+  zstat -A s +mtime "$1" 2>/dev/null && print -- "${s[1]}" || stat -f %m "$1" 2>/dev/null
 }
 
 cmd_watch() {
@@ -794,9 +854,9 @@ cmd_watch() {
   # zsh keeps the functions it parsed at start, so a long-lived watch would
   # run stale code forever after a `git pull`; re-exec when the file changes.
   local stamp
-  stamp=$(stat -f %m "$SCRIPT_PATH")
+  stamp=$(file_mtime "$SCRIPT_PATH")
   while :; do
-    [[ "$(stat -f %m "$SCRIPT_PATH" 2>/dev/null)" == "$stamp" ]] ||
+    [[ "$(file_mtime "$SCRIPT_PATH")" == "$stamp" ]] ||
       exec /bin/zsh "$SCRIPT_PATH" watch
     adopt_strays
     sleep 3
@@ -981,16 +1041,20 @@ cmd_setup() {
 }
 
 cmd_list() {
-  local d found=0
+  local d found=0 display color pid status app launcher_status
   for d in "$APP_SUPPORT"/Claude-*(N/); do
     found=1
-    local display="${${d:t}#Claude-}"
-    local app="$LAUNCHER_DIR/Claude $display.app"
+    display="${${d:t}#Claude-}"
+    color=$(color_of_profile "$d")
+    pid=$(instance_pid "$d")
+    [[ -n "$pid" ]] && status="running (pid $pid)" || status="stopped"
+    app="$LAUNCHER_DIR/Claude $display.app"
     if [[ -d "$app" ]]; then
-      print -- "  $display\t$d\t(launcher ok)"
+      launcher_status="launcher ok"
     else
-      print -- "  $display\t$d\t(launcher MISSING — run: cdp add $(slugify "$display"))"
+      launcher_status="launcher MISSING — run: cdp add $(slugify "$display")"
     fi
+    print -- "  $display\t[$color]\t$status\t($launcher_status)\t$d"
   done
   (( found )) || info "No profiles yet. Create one with: cdp add <name>"
 }
@@ -998,10 +1062,16 @@ cmd_list() {
 cmd_remove() {
   local raw="${1:-}" mode="${2:-}"
   [[ -n "$raw" ]] || err "Usage: cdp remove <name> [--keep-data|--delete-data]"
-  local display data_dir app_path
+  local display data_dir app_path pid
   display=$(displayify "$(slugify "$raw")")
   data_dir="$APP_SUPPORT/Claude-$display"
   app_path="$LAUNCHER_DIR/Claude $display.app"
+
+  pid=$(instance_pid "$data_dir")
+  if [[ -n "$pid" ]]; then
+    info "Stopping running instance of '$display' (pid $pid)…"
+    stop_pid "$pid"
+  fi
 
   [[ -d "$app_path" ]] && { rm -rf "$app_path"; ok "Deleted launcher $app_path" }
 
@@ -1040,10 +1110,14 @@ USAGE
   cdp add <name> [--color <c>]
                       Create a profile + Spotlight launcher
                       (e.g. cdp add personal --color blue)
-  cdp launch <name>   Launch a profile (or focus it if already running).
+  cdp launch <name> [--solo]
+                      Launch a profile (or focus it if already running).
+                      --solo stops all other running Claude instances first
+                      (recommended before first sign-in).
                       Runs from a per-profile Claude.app clone, so the Dock
                       tile wears the profile color and owns the window, with
                       its own Claude Code config dir (CLAUDE_CONFIG_DIR)
+  cdp stop <name>     Stop a running profile instance (alias: cdp quit)
   cdp watchdog [install|uninstall|status]
                       LaunchAgent that re-homes a clone relaunched without
                       its profile (Claude's self-update does that). Installed
@@ -1052,7 +1126,7 @@ USAGE
   cdp color <name> <c>
                       Change a profile's icon color
                       (orange red yellow green teal blue purple pink)
-  cdp list            List profiles and launcher health
+  cdp list            List profiles, color, running status, and launcher health
   cdp remove <name>   Remove a profile's launcher; add --keep-data or
                       --delete-data to skip the interactive question
   cdp gui             Build + install the "Claude Profiles" SwiftUI app
@@ -1076,6 +1150,7 @@ EOF
 case "${1:-help}" in
   add)     shift; cmd_add "$@" ;;
   launch)  shift; cmd_launch "$@" ;;
+  stop|quit) shift; cmd_stop "$@" ;;
   watch)   shift; cmd_watch "$@" ;;
   watchdog) shift; cmd_watchdog "$@" ;;
   color)   shift; cmd_color "$@" ;;
